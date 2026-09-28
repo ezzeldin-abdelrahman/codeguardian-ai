@@ -91,6 +91,30 @@ class ProviderTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no review text"):
                 review_code("x = 1", "openai", "chosen", "fake")
 
+    def test_openai_status_errors_report_reason_and_redact_key(self):
+        import httpx
+        from openai import APIStatusError
+
+        for status, reason in [(401, "Invalid key"), (404, "Model not found"),
+                               (429, "Quota exceeded"), (503, "Service unavailable")]:
+            response = httpx.Response(status, request=httpx.Request("POST", "https://example.com"))
+            error = APIStatusError("Request failed", response=response,
+                                   body={"message": f"{reason}: secret-key"})
+            with self.subTest(status=status), patch("openai.OpenAI", side_effect=error):
+                with self.assertRaises(RuntimeError) as caught:
+                    review_code("x = 1", "openai", "chosen", "secret-key")
+                self.assertIn(f"{status}: {reason}", str(caught.exception))
+                self.assertNotIn("secret-key", str(caught.exception))
+
+    def test_openai_timeout_is_distinct_from_connection_error(self):
+        import httpx
+        from openai import APITimeoutError
+
+        error = APITimeoutError(httpx.Request("POST", "https://example.com"))
+        with patch("openai.OpenAI", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                review_code("x = 1", "openai", "chosen", "fake")
+
     def test_network_errors_do_not_expose_credentials(self):
         import httpx
         from openai import APIConnectionError

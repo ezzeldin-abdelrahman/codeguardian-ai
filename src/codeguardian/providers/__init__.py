@@ -66,7 +66,7 @@ def review_code(contents, provider, model, api_key):
             except TransportError:
                 raise RuntimeError("Could not connect to Gemini. Check your connection or try again.") from None
         elif provider == "openai":
-            from openai import APIError, OpenAI
+            from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, OpenAI
 
             try:
                 with OpenAI(api_key=api_key, timeout=60.0, max_retries=0) as client:
@@ -74,8 +74,19 @@ def review_code(contents, provider, model, api_key):
                         model=model, instructions=instructions, input=contents,
                     )
                     text = response.output_text
+            except APITimeoutError:
+                raise RuntimeError("OpenAI request timed out. Try again later.") from None
+            except APIConnectionError:
+                raise RuntimeError("Could not connect to OpenAI. Check your connection, proxy, and certificates.") from None
+            except APIStatusError as error:
+                message = error.message
+                if isinstance(error.body, dict):
+                    message = error.body.get("message") or message
+                if api_key:
+                    message = message.replace(api_key, "[REDACTED]")
+                raise RuntimeError(f"OpenAI API error {error.status_code}: {message}") from None
             except APIError:
-                raise RuntimeError("OpenAI request failed. Check your key, model access, quota, and connection.") from None
+                raise RuntimeError("OpenAI returned an unexpected response. Try again later.") from None
         else:
             raise ValueError("Supported providers: gemini, openai.")
     except ImportError:
