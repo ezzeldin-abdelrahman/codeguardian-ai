@@ -69,6 +69,53 @@ class ProviderTests(unittest.TestCase):
             self.assertIn("Review", arguments["config"].system_instruction)
             self.assertTrue(arguments["config"].automatic_function_calling.disable)
 
+    def test_new_provider_settings_and_free_restriction(self):
+        for provider, model in [("groq", "openai/gpt-oss-120b"), ("openrouter", "openrouter/free")]:
+            os.environ[f"{provider.upper()}_MODEL"] = model
+            os.environ[f"{provider.upper()}_API_KEY"] = "fake"
+            self.assertEqual(get_settings(provider), (provider, model, "fake"))
+        self.assertEqual(get_settings("openrouter", "example/model:free")[1], "example/model:free")
+        with self.assertRaisesRegex(ValueError, "requires"):
+            get_settings("openrouter", "paid/model")
+        with patch("openai.OpenAI") as factory:
+            with self.assertRaisesRegex(ValueError, "requires"):
+                review_code("x = 1", "openrouter", "paid/model", "fake")
+            factory.assert_not_called()
+
+    def test_new_provider_routing_and_empty_response(self):
+        for provider, endpoint, model in [
+            ("groq", "https://api.groq.com/openai/v1", "chosen"),
+            ("openrouter", "https://openrouter.ai/api/v1", "openrouter/free"),
+        ]:
+            with self.subTest(provider=provider), patch("openai.OpenAI") as factory:
+                client = factory.return_value.__enter__.return_value
+                client.chat.completions.create.return_value = SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="Review"))])
+                self.assertEqual(review_code("x = 1", provider, model, "fake"), "Review")
+                self.assertEqual(factory.call_args.kwargs["base_url"], endpoint)
+                self.assertEqual(factory.call_args.kwargs["api_key"], "fake")
+                args = client.chat.completions.create.call_args.kwargs
+                self.assertEqual(args["model"], model)
+                self.assertEqual(args["messages"][1], {"role": "user", "content": "x = 1"})
+                client.responses.create.assert_not_called()
+                client.chat.completions.create.return_value = SimpleNamespace(choices=[])
+                with self.assertRaisesRegex(RuntimeError, "no review text"):
+                    review_code("x = 1", provider, model, "fake")
+
+    def test_new_provider_errors_use_correct_name(self):
+        import httpx
+        from openai import APIStatusError
+
+        error = APIStatusError("Invalid secret-key", response=httpx.Response(
+            401, request=httpx.Request("POST", "https://example.com")), body=None)
+        for provider, label, model in [("groq", "Groq", "chosen"),
+                                       ("openrouter", "OpenRouter", "openrouter/free")]:
+            with patch("openai.OpenAI", side_effect=error):
+                with self.assertRaises(RuntimeError) as caught:
+                    review_code("x = 1", provider, model, "secret-key")
+                self.assertIn(f"{label} API error 401", str(caught.exception))
+                self.assertNotIn("secret-key", str(caught.exception))
+
     def test_gemini_api_error_reports_reason_and_redacts_key(self):
         from google.genai.errors import APIError
 

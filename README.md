@@ -1,6 +1,6 @@
 # CodeGuardian AI
 
-Reads one source file, sends its text to Gemini or OpenAI, and prints an unverified AI review.
+Reads one source file, sends its text to Gemini, OpenAI, Groq, or OpenRouter, and prints an unverified AI review.
 The source is not executed. API requests send the source to the selected provider and may cost money.
 
 ## Setup
@@ -26,12 +26,12 @@ python src/codeguardian/reviewer.py path/to/nonempty_file.py --provider openai
 python src/codeguardian/reviewer.py path/to/nonempty_file.py --provider gemini --model YOUR_MODEL_ID
 ```
 
-`samples/vulnerable_app.py` is currently empty; add a small example before reviewing it.
+Use `samples/vulnerable_app.py` for a sample review.
 
 ## Configuration
 
-- `AI_PROVIDER`: default provider (`gemini` or `openai`).
-- `SUPPORTED_PROVIDERS`: comma-separated enabled providers; defaults to both.
+- `AI_PROVIDER`: default provider (`gemini`, `openai`, `groq`, or `openrouter`).
+- `SUPPORTED_PROVIDERS`: comma-separated enabled providers; defaults to all four.
 - `GEMINI_MODEL` / `OPENAI_MODEL`: each provider's default model.
 - `GEMINI_MODELS` / `OPENAI_MODELS`: optional comma-separated lists of allowed model IDs.
   If set, the selected model (including the default) must be in its provider's list.
@@ -46,3 +46,45 @@ A provider is the service you contact; a model is the specific AI selected withi
 `get_settings()` selects and validates configuration. `review_code()` uses a simple
 `if`/`elif` to call the appropriate SDK. Adding a name to configuration alone does
 not implement a new provider. No provider classes or agent frameworks are used.
+
+## Groq and OpenRouter
+
+Create keys in [Groq Console](https://console.groq.com/keys) and
+[OpenRouter](https://openrouter.ai/settings/keys), then fill in the corresponding
+placeholders in your local `.env`:
+
+```dotenv
+GROQ_API_KEY=your_groq_key
+GROQ_MODEL=openai/gpt-oss-120b
+OPENROUTER_API_KEY=your_openrouter_key
+OPENROUTER_MODEL=openrouter/free
+```
+
+If `SUPPORTED_PROVIDERS` is set, include `groq,openrouter` in it.
+Keep `AI_PROVIDER` unchanged to retain your current default.
+Optional `GROQ_MODELS` and `OPENROUTER_MODELS` accept comma-separated allowlists,
+just like the existing providers.
+
+```bash
+python src/codeguardian/reviewer.py samples/vulnerable_app.py --provider groq
+python src/codeguardian/reviewer.py samples/vulnerable_app.py --provider openrouter
+python src/codeguardian/reviewer.py samples/vulnerable_app.py --provider groq --model openai/gpt-oss-20b
+```
+
+Both integrations reuse the OpenAI Python SDK with their own server address and key;
+they do not use your OpenAI account balance. Groq uses your Groq account's plan and
+limits: remain on its free plan for free usage.
+OpenRouter is restricted to `openrouter/free` or IDs ending in `:free`.
+The free router can choose a different model each time. For repeatable comparisons,
+choose a specific available `:free` model using `--model`. Appending `:free` works
+only if that model has a free variant. No paid fallback is configured.
+
+Requests use Chat Completions: a system message holds review instructions, and a user
+message holds source text. The returned message content is the review. Existing OpenAI
+requests continue to use the Responses API. No extra dependencies are needed.
+
+References: [Groq compatibility](https://console.groq.com/docs/openai),
+[OpenRouter free variants](https://openrouter.ai/docs/guides/routing/model-variants/free),
+[free router](https://openrouter.ai/openrouter/free).
+
+Run offline tests with `python -m unittest discover -s tests -v`.
