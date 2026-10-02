@@ -27,6 +27,66 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(get_settings(model="alternative")[1], "alternative")
         self.assertEqual(os.environ["AI_PROVIDER"], "gemini")
 
+    def test_structured_findings_validation_and_display(self):
+        import json
+        import io
+        from contextlib import redirect_stdout
+        from codeguardian.reviewer import parse_findings, print_findings
+
+        finding = dict(category="bug", severity="high", title="Division by zero",
+                       line=2, description="The divisor may be zero.", recommendation="Check the divisor.")
+        for line in (2, None):
+            finding["line"] = line
+            result = parse_findings(json.dumps({"findings": [finding]}))
+            self.assertEqual(result, [finding])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                print_findings(result)
+            self.assertIn("1. [HIGH] BUG", output.getvalue())
+            self.assertIn("Line: " + ("2" if line else "Not specified"), output.getvalue())
+        self.assertEqual(parse_findings('{"findings": []}'), [])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            print_findings([])
+        self.assertEqual(output.getvalue(), "No findings reported.\n")
+
+        for text in ("not JSON", '```json\n{"findings": []}\n```', '{"findings":'):
+            with self.assertRaisesRegex(ValueError, "invalid JSON"):
+                parse_findings(text)
+        for value in ([], None, {}, {"findings": {}}, {"findings": [None]}):
+            with self.assertRaises(ValueError):
+                parse_findings(json.dumps(value))
+        for field in finding:
+            incomplete = finding.copy()
+            del incomplete[field]
+            with self.assertRaisesRegex(ValueError, "missing"):
+                parse_findings(json.dumps({"findings": [incomplete]}))
+        for field, values in {
+            "category": ["unknown", [], None], "severity": ["urgent", {}, 2],
+            "line": [True, False, 0, -1, 1.5, "2"],
+            "title": ["", "  ", 5], "description": [None, ""],
+            "recommendation": [[], ""],
+        }.items():
+            for value in values:
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    parse_findings(json.dumps({"findings": [dict(finding, **{field: value})]}))
+
+    def test_invalid_json_is_reported_by_cli(self):
+        import io
+        from contextlib import redirect_stderr
+        from codeguardian import reviewer
+
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["reviewer.py", __file__]), \
+             patch.object(reviewer, "load_dotenv"), \
+             patch.object(reviewer, "get_settings", return_value=("groq", "chosen", "fake")), \
+             patch.object(reviewer, "review_code", return_value="invalid JSON"), \
+             redirect_stderr(output):
+            with self.assertRaises(SystemExit) as caught:
+                reviewer.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("Error: The model returned invalid JSON", output.getvalue())
+
     def test_multiple_models_and_provider_specific_validation(self):
         os.environ["GEMINI_MODELS"] = "gemini-default, alternative"
         os.environ["OPENAI_MODELS"] = "openai-default"
@@ -65,7 +125,7 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(review_code("x = 1", "gemini", "chosen", "fake"), "Gemini review")
             arguments = client.models.generate_content.call_args.kwargs
             self.assertEqual(arguments["model"], "chosen")
-            self.assertEqual(arguments["contents"], "x = 1")
+            self.assertEqual(arguments["contents"], "1: x = 1")
             self.assertIn("Review", arguments["config"].system_instruction)
             self.assertTrue(arguments["config"].automatic_function_calling.disable)
 
@@ -96,7 +156,7 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(factory.call_args.kwargs["api_key"], "fake")
                 args = client.chat.completions.create.call_args.kwargs
                 self.assertEqual(args["model"], model)
-                self.assertEqual(args["messages"][1], {"role": "user", "content": "x = 1"})
+                self.assertEqual(args["messages"][1], {"role": "user", "content": "1: x = 1"})
                 client.responses.create.assert_not_called()
                 client.chat.completions.create.return_value = SimpleNamespace(choices=[])
                 with self.assertRaisesRegex(RuntimeError, "no review text"):
@@ -133,7 +193,7 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(review_code("x = 1", "openai", "chosen", "fake"), "OpenAI review")
             arguments = client.responses.create.call_args.kwargs
             self.assertEqual(arguments["model"], "chosen")
-            self.assertEqual(arguments["input"], "x = 1")
+            self.assertEqual(arguments["input"], "1: x = 1")
             client.responses.create.return_value = SimpleNamespace(output_text="")
             with self.assertRaisesRegex(RuntimeError, "no review text"):
                 review_code("x = 1", "openai", "chosen", "fake")

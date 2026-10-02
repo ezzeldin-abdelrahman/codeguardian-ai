@@ -88,3 +88,20 @@ References: [Groq compatibility](https://console.groq.com/docs/openai),
 [free router](https://openrouter.ai/openrouter/free).
 
 Run offline tests with `python -m unittest discover -s tests -v`.
+
+## v0.2: Structured findings
+
+The model is prompted to return only `{"findings": [...]}`. Each finding contains
+`category` (bug/security/quality/testing), `severity` (low/medium/high/critical),
+nonempty `title`, `description`, and `recommendation` strings, and `line`
+(a positive integer or null). An empty findings list is valid.
+
+The application numbers source lines before sending them, parses the response with
+Python's built-in `json.loads()`, checks required fields and types, then prints a
+readable review. Invalid JSON or invalid fields produce a clear error and exit
+status 1. Markdown fences and surrounding prose are rejected, not repaired.
+
+This is prompt-based JSON output, not a provider-enforced schema. Providers may
+still return invalid responses. Validation checks structure, not whether a finding
+is true or its line reference is correct. All four providers and existing CLI
+options remain supported. No new dependencies are required.
