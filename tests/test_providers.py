@@ -48,7 +48,7 @@ class ProviderTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             print_findings([])
-        self.assertEqual(output.getvalue(), "No findings reported.\n")
+        self.assertEqual(output.getvalue(), "No findings\n")
 
         for text in ("not JSON", '```json\n{"findings": []}\n```', '{"findings":'):
             with self.assertRaisesRegex(ValueError, "invalid JSON"):
@@ -73,7 +73,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_invalid_json_is_reported_by_cli(self):
         import io
-        from contextlib import redirect_stderr
+        from contextlib import redirect_stdout
         from codeguardian import reviewer
 
         output = io.StringIO()
@@ -81,7 +81,9 @@ class ProviderTests(unittest.TestCase):
              patch.object(reviewer, "load_dotenv"), \
              patch.object(reviewer, "get_settings", return_value=("groq", "chosen", "fake")), \
              patch.object(reviewer, "review_code", return_value="invalid JSON"), \
-             redirect_stderr(output):
+             patch.object(reviewer, "run_bandit", return_value=[]), \
+             patch.object(reviewer, "run_ruff", return_value=[]), \
+             redirect_stdout(output):
             with self.assertRaises(SystemExit) as caught:
                 reviewer.main()
         self.assertEqual(caught.exception.code, 1)
@@ -96,6 +98,47 @@ class ProviderTests(unittest.TestCase):
         os.environ["GEMINI_MODELS"] = "alternative"
         with self.assertRaisesRegex(ValueError, "GEMINI_MODELS"):
             get_settings()
+
+    def test_three_analysis_sections_and_independent_failures(self):
+        import io
+        import json
+        from contextlib import redirect_stdout
+        from codeguardian import reviewer
+
+        finding = dict(category="quality", severity="low", title="Example finding",
+                       line=1, description="Example issue", recommendation="Review this code")
+        for failing in (None, "llm", "bandit", "ruff"):
+            output = io.StringIO()
+            with self.subTest(failing=failing), \
+                 patch.object(sys, "argv", ["reviewer.py", __file__]), \
+                 patch.object(reviewer, "load_dotenv"), \
+                 patch.object(reviewer, "get_settings", return_value=("groq", "chosen", "fake")), \
+                 patch.object(reviewer, "review_code", return_value=json.dumps({"findings": [finding]})) as ai, \
+                 patch.object(reviewer, "run_bandit", return_value=[dict(finding, source="bandit")]) as bandit, \
+                 patch.object(reviewer, "run_ruff", return_value=[]) as ruff, \
+                 patch.object(reviewer, "print_findings", wraps=reviewer.print_findings) as display, \
+                 redirect_stdout(output):
+                if failing:
+                    {"llm": ai, "bandit": bandit, "ruff": ruff}[failing].side_effect = RuntimeError("Simulated failure")
+                    with self.assertRaises(SystemExit) as caught:
+                        reviewer.main()
+                    self.assertEqual(caught.exception.code, 1)
+                else:
+                    reviewer.main()
+                ai.assert_called_once()
+                bandit.assert_called_once_with(Path(__file__))
+                ruff.assert_called_once_with(Path(__file__))
+                if failing != "llm":
+                    self.assertEqual(display.call_args_list[0].args[0][0]["source"], "llm")
+            text = output.getvalue()
+            headings = ["=== AI Review ===", "=== Bandit Security Analysis ===", "=== Ruff Code Quality Analysis ==="]
+            positions = [text.index(heading) for heading in headings]
+            self.assertEqual(positions, sorted(positions))
+            self.assertEqual(text.count("Example finding"), 1 if failing in ("llm", "bandit") else 2)
+            if failing != "ruff":
+                self.assertIn("No findings", text)
+            if failing:
+                self.assertIn("Error: Simulated failure", text)
 
     def test_disabled_and_unknown_providers(self):
         os.environ["SUPPORTED_PROVIDERS"] = "gemini"

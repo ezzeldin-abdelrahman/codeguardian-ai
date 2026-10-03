@@ -5,8 +5,10 @@ from dotenv import load_dotenv
 
 if __package__:
     from .providers import get_settings, review_code
+    from .tools import run_bandit, run_ruff
 else:
     from providers import get_settings, review_code
+    from tools import run_bandit, run_ruff
 
 
 def parse_findings(response_text):
@@ -43,7 +45,7 @@ def parse_findings(response_text):
 def print_findings(findings):
     """Display validated findings as a readable review."""
     if not findings:
-        print("No findings reported.")
+        print("No findings")
         return
     for number, finding in enumerate(findings, start=1):
         if number > 1:
@@ -56,7 +58,7 @@ def print_findings(findings):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ask an AI model to review a source file.")
+    parser = argparse.ArgumentParser(description="Review a source file with AI, Bandit, and Ruff.")
     parser.add_argument("filename", help="Path to the file to read")
     parser.add_argument("--provider", help="Override AI_PROVIDER for this run")
     parser.add_argument("--model", help="Override the selected provider's default model")
@@ -76,13 +78,35 @@ def main():
     if not contents.strip():
         parser.exit(status=1, message="Error: the source file is empty.\n")
 
+    failed = False
+    print("=== AI Review ===")
     try:
         provider, model, api_key = get_settings(args.provider, args.model)
         review = review_code(contents, provider, model, api_key)
         findings = parse_findings(review)
+        for finding in findings:
+            finding["source"] = "llm"
+        print_findings(findings)
     except (ValueError, RuntimeError) as error:
-        parser.exit(status=1, message=f"Error: {error}\n")
-    print_findings(findings)
+        print(f"Error: {error}")
+        failed = True
+
+    print("\n=== Bandit Security Analysis ===")
+    try:
+        print_findings(run_bandit(path))
+    except RuntimeError as error:
+        print(f"Error: {error}")
+        failed = True
+
+    print("\n=== Ruff Code Quality Analysis ===")
+    try:
+        print_findings(run_ruff(path))
+    except RuntimeError as error:
+        print(f"Error: {error}")
+        failed = True
+
+    if failed:
+        parser.exit(status=1)
 
 
 if __name__ == "__main__":
