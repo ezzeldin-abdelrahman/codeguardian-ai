@@ -4,57 +4,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 if __package__:
+    from .agent import run_agent
+    from .findings import parse_findings, print_findings
     from .providers import get_settings, review_code
     from .tools import run_bandit, run_ruff
 else:
+    from agent import run_agent
+    from findings import parse_findings, print_findings
     from providers import get_settings, review_code
     from tools import run_bandit, run_ruff
-
-
-def parse_findings(response_text):
-    """Parse JSON and check the required fields before displaying any findings."""
-    try:
-        review = json.loads(response_text)
-    except json.JSONDecodeError as error:
-        raise ValueError(f"The model returned invalid JSON: {error.msg} (response line {error.lineno}).") from None
-
-    if not isinstance(review, dict) or not isinstance(review.get("findings"), list):
-        raise ValueError("The review must be a JSON object containing a findings list.")
-
-    required = ("category", "severity", "title", "line", "description", "recommendation")
-    for number, finding in enumerate(review["findings"], start=1):
-        if not isinstance(finding, dict):
-            raise ValueError(f"Finding {number} must be an object.")
-        for field in required:
-            if field not in finding:
-                raise ValueError(f"Finding {number} is missing '{field}'.")
-        if finding["category"] not in ("bug", "security", "quality", "testing"):
-            raise ValueError(f"Finding {number} has an invalid category.")
-        if finding["severity"] not in ("low", "medium", "high", "critical"):
-            raise ValueError(f"Finding {number} has an invalid severity.")
-        for field in ("title", "description", "recommendation"):
-            if not isinstance(finding[field], str) or not finding[field].strip():
-                raise ValueError(f"Finding {number}: '{field}' must be a nonempty string.")
-        line = finding["line"]
-        # bool is a subclass of int in Python, so check the exact type here.
-        if line is not None and (type(line) is not int or line < 1):
-            raise ValueError(f"Finding {number}: 'line' must be a positive integer or null.")
-    return review["findings"]
-
-
-def print_findings(findings):
-    """Display validated findings as a readable review."""
-    if not findings:
-        print("No findings")
-        return
-    for number, finding in enumerate(findings, start=1):
-        if number > 1:
-            print()
-        print(f"{number}. [{finding['severity'].upper()}] {finding['category'].upper()} — {finding['title']}")
-        line = finding["line"] if finding["line"] is not None else "Not specified"
-        print(f"   Line: {line}")
-        print(f"   Description: {finding['description']}")
-        print(f"   Recommendation: {finding['recommendation']}")
 
 
 def main():
@@ -62,7 +20,11 @@ def main():
     parser.add_argument("filename", help="Path to the file to read")
     parser.add_argument("--provider", help="Override AI_PROVIDER for this run")
     parser.add_argument("--model", help="Override the selected provider's default model")
+    parser.add_argument("--agent", action="store_true", help="Use the bounded Groq agent")
+    parser.add_argument("--trace-file", type=Path, help="Save agent actions and observations as JSON")
     args = parser.parse_args()
+    if args.trace_file and not args.agent:
+        parser.error("--trace-file requires --agent")
 
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -77,6 +39,37 @@ def main():
 
     if not contents.strip():
         parser.exit(status=1, message="Error: the source file is empty.\n")
+
+    if args.agent:
+        if args.trace_file and args.trace_file.resolve() == path.resolve():
+            parser.error("The trace file must not overwrite the source file")
+        try:
+            provider, model, api_key = get_settings(args.provider or "groq", args.model)
+            if provider != "groq":
+                raise ValueError("Agent mode supports only Groq. Use --provider groq.")
+            report = run_agent(path, model, api_key)
+        except (ValueError, RuntimeError) as error:
+            parser.exit(status=1, message=f"Error: {error}\n")
+        print("=== Agent Review ===")
+        for event in report["trace"]:
+            print(f"Step {event['step']}: {event['tool']} "
+                  f"({'ok' if event['observation']['ok'] else 'error'})")
+            if not event["observation"]["ok"]:
+                print(f"  {event['observation']['error']}")
+        if report["status"] == "complete":
+            print_findings(report["findings"])
+        else:
+            print(f"Incomplete review: {report['error']}")
+        if args.trace_file:
+            try:
+                # Exclusive creation prevents overwriting an existing file.
+                with args.trace_file.open("x", encoding="utf-8") as output:
+                    json.dump(report, output, indent=2)
+            except OSError as error:
+                parser.exit(status=1, message=f"Could not save trace: {error}\n")
+        if report["status"] != "complete":
+            parser.exit(status=1)
+        return
 
     failed = False
     print("=== AI Review ===")

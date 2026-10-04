@@ -6,6 +6,15 @@ import sys
 from pathlib import Path
 
 
+def inspect_code(file_path):
+    """Read the selected file without executing it and preserve line numbers."""
+    try:
+        contents = Path(file_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError(f"Could not inspect source: {error}") from None
+    return "\n".join(f"{number}: {line}" for number, line in enumerate(contents.splitlines(), 1))
+
+
 def run_bandit(file_path):
     """Return security findings; raise RuntimeError if Bandit cannot scan the file."""
     path = Path(file_path).resolve()

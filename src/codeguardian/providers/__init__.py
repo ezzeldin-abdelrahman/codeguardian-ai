@@ -150,3 +150,44 @@ def review_code(contents, provider, model, api_key):
     if not text or not text.strip():
         raise RuntimeError("The provider returned no review text. The response may have been blocked.")
     return text
+
+
+def request_agent_turn(messages, tools, model, api_key, allow_tools=True):
+    """Make one Groq request and return only tool decisions or final text."""
+    try:
+        from openai import OpenAI, APIError, APIStatusError, APIConnectionError, APITimeoutError
+    except ImportError:
+        raise RuntimeError("Missing SDK. Run: python -m pip install -r requirements.txt") from None
+    try:
+        with OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1",
+                    timeout=60.0, max_retries=0) as client:
+            response = client.chat.completions.create(
+                model=model, messages=messages, tools=tools,
+                tool_choice="auto" if allow_tools else "none",
+                parallel_tool_calls=False,
+                max_completion_tokens=4096,
+                extra_body={"include_reasoning": False},
+            )
+    except APITimeoutError:
+        raise RuntimeError("Groq agent request timed out.") from None
+    except APIConnectionError:
+        raise RuntimeError("Could not connect to Groq.") from None
+    except APIStatusError as error:
+        # Avoid retaining a raw response, which could contain reasoning or credentials.
+        raise RuntimeError(f"Groq agent API error {error.status_code}. Check access, quota, and model support.") from None
+    except APIError:
+        raise RuntimeError("Groq returned an unexpected agent response.") from None
+    if not response.choices:
+        raise RuntimeError("Groq returned no agent response.")
+    choice = response.choices[0]
+    if choice.finish_reason not in ("stop", "tool_calls"):
+        raise RuntimeError("Groq did not complete the agent response (possibly an output limit or refusal).")
+    message = choice.message
+    calls = []
+    for call in message.tool_calls or []:
+        if call.type != "function":
+            raise RuntimeError("Groq returned an unsupported tool request type.")
+        calls.append({"id": call.id, "type": "function", "function": {
+            "name": call.function.name, "arguments": call.function.arguments,
+        }})
+    return {"tool_calls": calls, "content": None if calls else message.content}

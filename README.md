@@ -124,3 +124,50 @@ blocks from the response and reports truncated output rather than parsing partia
 JSON. The output limit is 4096 tokens. Your default provider is unchanged.
 This integration requires Anthropic API access and any applicable API credits.
 Reference: https://platform.claude.com/docs/en/api/python/messages/create
+
+## v0.4: Tool-using agent (Groq only)
+
+The original sequential review remains the default. Use `--agent` to let one model
+choose between `inspect_code`, `run_bandit`, and `run_ruff`:
+
+```bash
+.venv/bin/python src/codeguardian/reviewer.py samples/vulnerable_app.py --agent --model openai/gpt-oss-120b
+.venv/bin/python src/codeguardian/reviewer.py samples/vulnerable_app.py --agent --trace-file review-trace.json
+```
+
+Agent mode selects Groq unless a provider is explicitly supplied; other providers
+are rejected in agent mode. It uses GROQ_API_KEY and GROQ_MODEL and honors the
+existing provider/model allowlists. No default environment setting is changed.
+
+A tool request is a name and an empty argument object. Python binds all three
+tools to the user-selected file and executes only those named functions. The
+model receives the result as an observation before choosing its next action.
+No shell commands or alternate paths can be supplied by the model. Source code
+and observations are sent to Groq; the source is never executed.
+
+The loop allows five investigation turns and at most one finalization request.
+Invalid requests and failed tools consume turns. Multiple calls in one turn are
+rejected, and tools are disabled for finalization. Tool and API requests time out
+after 60 seconds; API retries are disabled. An API failure or invalid final JSON
+produces an incomplete review with exit status 1. Tool failures become observations
+and remain visible in the terminal even if the agent later finishes successfully.
+
+Final findings use the existing structure and source `llm`. Bandit/Ruff results
+retain their original source labels in observations. There is no automatic
+three-tool sequence, deduplication, or evidence verification.
+
+The optional trace file records status, final findings, tool names, arguments,
+call IDs, execution flags, and observations. It can include source text, so share
+it only when appropriate. No raw SDK responses, reasoning fields, or API keys
+are deliberately recorded. Groq requests set `include_reasoning=False`. Trace
+files are created only if the path does not already exist, to prevent overwrites.
+
+Implementation: `agent.py` controls the loop; `providers.request_agent_turn()`
+makes one request; `tools.py` executes tools; `findings.py` validates and displays
+findings. This is ordinary Python with no agent framework.
+
+Tests mock model responses, so they do not use API credits. Run them with:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```

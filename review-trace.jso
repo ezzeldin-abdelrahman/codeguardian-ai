@@ -1,0 +1,87 @@
+{
+  "status": "incomplete",
+  "findings": [],
+  "trace": [
+    {
+      "step": 1,
+      "call_id": "fc_8e92a487-2d76-4a38-bc57-a862ae79bf7a",
+      "tool": "inspect_code",
+      "arguments": {},
+      "executed": true,
+      "observation": {
+        "ok": true,
+        "code": "1: import sqlite3\n2: \n3: \n4: DATABASE = \"users.db\"\n5: \n6: # Intentionally insecure example used for CodeGuardian AI testing.\n7: ADMIN_PASSWORD = \"admin123\"\n8: \n9: \n10: def get_user(username):\n11:     connection = sqlite3.connect(DATABASE)\n12:     cursor = connection.cursor()\n13: \n14:     # Intentionally vulnerable: user input is inserted directly into SQL.\n15:     query = \"SELECT * FROM users WHERE username = '\" + username + \"'\"\n16:     cursor.execute(query)\n17: \n18:     user = cursor.fetchone()\n19:     connection.close()\n20: \n21:     return user\n22: \n23: \n24: def login(username, password):\n25:     user = get_user(username)\n26: \n27:     if user is None:\n28:         return False\n29: \n30:     # Intentionally insecure authentication logic.\n31:     if password == ADMIN_PASSWORD:\n32:         return True\n33: \n34:     return False\n35: \n36: \n37: def delete_user(username):\n38:     connection = sqlite3.connect(DATABASE)\n39:     cursor = connection.cursor()\n40: \n41:     query = \"DELETE FROM users WHERE username = '\" + username + \"'\"\n42:     cursor.execute(query)\n43: \n44:     connection.commit()\n45:     connection.close()\n46: \n47: \n48: if __name__ == \"__main__\":\n49:     username = input(\"Username: \")\n50:     password = input(\"Password: \")\n51: \n52:     if login(username, password):\n53:         print(\"Login successful\")\n54:     else:\n55:         print(\"Login failed\")"
+      }
+    },
+    {
+      "step": 2,
+      "call_id": "fc_e301c605-cb59-44b6-b908-4a5089f5ab8c",
+      "tool": "run_bandit",
+      "arguments": {},
+      "executed": true,
+      "observation": {
+        "ok": true,
+        "findings": [
+          {
+            "source": "bandit",
+            "category": "security",
+            "severity": "low",
+            "title": "B105: hardcoded_password_string",
+            "line": 7,
+            "description": "Possible hardcoded password: 'admin123'",
+            "recommendation": "Review this security issue and replace the unsafe pattern. See: https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html"
+          },
+          {
+            "source": "bandit",
+            "category": "security",
+            "severity": "medium",
+            "title": "B608: hardcoded_sql_expressions",
+            "line": 15,
+            "description": "Possible SQL injection vector through string-based query construction.",
+            "recommendation": "Review this security issue and replace the unsafe pattern. See: https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html"
+          },
+          {
+            "source": "bandit",
+            "category": "security",
+            "severity": "medium",
+            "title": "B608: hardcoded_sql_expressions",
+            "line": 41,
+            "description": "Possible SQL injection vector through string-based query construction.",
+            "recommendation": "Review this security issue and replace the unsafe pattern. See: https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html"
+          }
+        ]
+      }
+    },
+    {
+      "step": 3,
+      "call_id": "fc_b8e14d59-f5c1-4951-b46e-75632f9fd213",
+      "tool": "run_ruff",
+      "arguments": {},
+      "executed": true,
+      "observation": {
+        "ok": true,
+        "findings": [
+          {
+            "source": "ruff",
+            "category": "quality",
+            "severity": "low",
+            "title": "I001: Import block is un-sorted or un-formatted",
+            "line": 1,
+            "description": "Import block is un-sorted or un-formatted",
+            "recommendation": "Organize imports"
+          },
+          {
+            "source": "ruff",
+            "category": "quality",
+            "severity": "low",
+            "title": "SIM103: Return the condition `password == ADMIN_PASSWORD` directly",
+            "line": 31,
+            "description": "Return the condition `password == ADMIN_PASSWORD` directly",
+            "recommendation": "Replace with `return password == ADMIN_PASSWORD`"
+          }
+        ]
+      }
+    }
+  ],
+  "error": "Groq agent API error 400. Check access, quota, and model support."
+}
