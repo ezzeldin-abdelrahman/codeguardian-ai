@@ -105,3 +105,22 @@ This is prompt-based JSON output, not a provider-enforced schema. Providers may
 still return invalid responses. Validation checks structure, not whether a finding
 is true or its line reference is correct. All four providers and existing CLI
 options remain supported. No new dependencies are required.
+
+## Claude provider
+
+Install the dependencies, then set `CLAUDE_API_KEY` to your Anthropic API key and
+`CLAUDE_MODEL` to an available model (example: `claude-sonnet-4-5`) in `.env`.
+Include `claude` in `SUPPORTED_PROVIDERS` if that setting is present.
+An optional `CLAUDE_MODELS` comma-separated allowlist works like other providers.
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python src/codeguardian/reviewer.py samples/vulnerable_app.py --provider claude
+```
+
+Claude uses the Anthropic Messages API with the same JSON review instructions.
+The application passes `CLAUDE_API_KEY` explicitly to the SDK. It extracts text
+blocks from the response and reports truncated output rather than parsing partial
+JSON. The output limit is 4096 tokens. Your default provider is unchanged.
+This integration requires Anthropic API access and any applicable API credits.
+Reference: https://platform.claude.com/docs/en/api/python/messages/create

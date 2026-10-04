@@ -27,6 +27,57 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(get_settings(model="alternative")[1], "alternative")
         self.assertEqual(os.environ["AI_PROVIDER"], "gemini")
 
+    def test_claude_settings(self):
+        os.environ["CLAUDE_MODEL"] = "chosen"
+        os.environ["CLAUDE_API_KEY"] = "fake"
+        os.environ["CLAUDE_MODELS"] = "chosen,alternative"
+        self.assertEqual(get_settings("claude"), ("claude", "chosen", "fake"))
+        self.assertEqual(get_settings("claude", "alternative")[1], "alternative")
+        with self.assertRaisesRegex(ValueError, "CLAUDE_MODELS"):
+            get_settings("claude", "not-allowed")
+        del os.environ["CLAUDE_API_KEY"]
+        with self.assertRaisesRegex(ValueError, "CLAUDE_API_KEY"):
+            get_settings("claude")
+
+    def test_claude_request_and_response(self):
+        with patch("anthropic.Anthropic") as factory:
+            client = factory.return_value.__enter__.return_value
+            response = SimpleNamespace(stop_reason="end_turn", content=[
+                SimpleNamespace(type="text", text='{"findings": []}'),
+                SimpleNamespace(type="thinking"),
+            ])
+            client.messages.create.return_value = response
+            self.assertEqual(review_code("x = 1", "claude", "chosen", "fake"), '{"findings": []}')
+            args = client.messages.create.call_args.kwargs
+            self.assertEqual(args["model"], "chosen")
+            self.assertEqual(args["messages"], [{"role": "user", "content": "1: x = 1"}])
+            self.assertIn('"findings"', args["system"])
+            self.assertEqual(args["max_tokens"], 4096)
+            response.stop_reason = "max_tokens"
+            with self.assertRaisesRegex(RuntimeError, "output limit"):
+                review_code("x = 1", "claude", "chosen", "fake")
+            response.stop_reason = "end_turn"
+            response.content = []
+            with self.assertRaisesRegex(RuntimeError, "no review text"):
+                review_code("x = 1", "claude", "chosen", "fake")
+
+    def test_claude_errors(self):
+        import httpx
+        from anthropic import APIStatusError, APIConnectionError, APITimeoutError
+
+        request = httpx.Request("POST", "https://example.com")
+        cases = [
+            (APIStatusError("Invalid secret-key", response=httpx.Response(401, request=request), body=None), "Claude API error 401"),
+            (APIConnectionError(request=request), "Could not connect to Claude"),
+            (APITimeoutError(request=request), "timed out"),
+        ]
+        for error, expected in cases:
+            with self.subTest(expected=expected), patch("anthropic.Anthropic", side_effect=error):
+                with self.assertRaises(RuntimeError) as caught:
+                    review_code("x = 1", "claude", "chosen", "secret-key")
+                self.assertIn(expected, str(caught.exception))
+                self.assertNotIn("secret-key", str(caught.exception))
+
     def test_structured_findings_validation_and_display(self):
         import json
         import io
