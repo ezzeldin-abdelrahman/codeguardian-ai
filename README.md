@@ -171,3 +171,108 @@ Tests mock model responses, so they do not use API credits. Run them with:
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
+
+## v0.5: Context-aware project investigation
+
+Pass a small Python project directory with `--agent`:
+
+```bash
+.venv/bin/python src/codeguardian/reviewer.py path/to/project --agent
+.venv/bin/python src/codeguardian/reviewer.py path/to/project --agent --trace-file project-review.json
+```
+
+Directory review uses the existing Groq agent and provider configuration. Single-file
+sequential review and single-file `--agent` behavior remain available. Directories
+without `--agent` produce a usage error. No new dependency or framework is required.
+
+The model can choose five tools in project mode:
+
+| Tool | Arguments | Observation |
+| --- | --- | --- |
+| `list_files` | `{}` | Eligible relative `.py` paths |
+| `inspect_file` | `path`, optional `start_line` and `end_line` | Original numbered lines; endpoints are inclusive |
+| `search_code` | `query` | Case-sensitive literal matches with file, line, and excerpt |
+| `run_bandit` | `path` | Normalized security findings |
+| `run_ruff` | `path` | Normalized quality findings |
+
+Python establishes the eligible-file list without reading source contents. The LLM
+chooses what to inspect; it is not given every file automatically. It can discover
+an import in one file, search for the imported symbol, and inspect its definition
+in another. Empty files can be inspected. Invalid ranges, unavailable tools, denied
+paths, or unreadable files become error observations instead of clean findings.
+
+Project findings add `file` (relative path or null) to the existing finding structure.
+A cited file and line must have appeared in a successful content-bearing observation
+actually delivered to the model. A listing alone does not count as evidence. A
+project-wide finding must use both `file: null` and `line: null`. Final findings
+remain labeled `source: llm`; original tool sources remain in the trace. These
+location checks do not verify the truth of a finding or establish complete coverage.
+
+### Limits
+
+The constants live in `project.py`:
+
+- 10 investigation turns plus at most one finalization request (single-file mode retains 5).
+- 100 eligible files, 2,000 directory entries examined, and 20 directory levels.
+- 100,000 bytes per source file; oversized files are excluded or refused if they grow.
+- 10 distinct files explicitly inspected or analyzed; repeat visits count once.
+- 100 lines per inspection, 20 matches per search, 60 matches across a review.
+- Search scans the bounded eligible-file list, separately from the explicit inspection budget.
+- 8,000 serialized characters per observation and 40,000 per request conversation,
+  including tool definitions, instructions, tool calls, and observations. This is
+  a character limit, not exact token accounting. The existing model output cap also applies.
+- Tool-request payloads are capped at 1,500 serialized characters in project mode.
+
+Whole output entries are removed when necessary, before JSON serialization, with
+`truncated: true`. Long search lines return at most 300 characters around the match.
+Counters conservatively include matches found even if context trimming omits them.
+The loop reserves context space for finalization and disables tools when it is nearly
+full. Coverage metadata records observed files, inspected files, search counts, and
+limits reached. A valid final report can still have partial coverage; the terminal
+makes that visible. Incomplete reports retain their trace.
+
+### Access boundaries
+
+Only eligible project-relative regular `.py` files can be read. Absolute paths,
+`..`, symlinks (including internal links), hard links, and special files are rejected.
+Hidden paths, Git internals, virtual environments (including directories containing
+`pyvenv.cfg`), dependency/build/cache directories, and names containing `secret`,
+`credential`, `password`, or `private_key` are excluded. `config_local.py` and
+`local_settings.py` are also excluded. This conservative policy may omit legitimate
+code; it is not a general secret detector. Credentials embedded in ordinary eligible
+source can still be sent to the provider. `.gitignore` is not interpreted in v0.5.
+
+`project.py` uses POSIX directory descriptors and `O_NOFOLLOW` to open path components
+without following symlinks. It checks the selected root's identity and file size at
+read time. Unsupported platforms fail closed. macOS and Linux are the initial target
+platforms. Review a stable local project: v0.5 does not provide a transactional snapshot
+of a concurrently changing filesystem or an operating-system sandbox.
+
+Project analyzer calls securely read the selected file, scan a temporary copy, and
+map findings back to the original relative path. Python subprocesses run with `-I`,
+a minimal environment, and a neutral working directory. Ruff uses `--isolated`;
+Bandit uses an empty INI file. Project-local tool settings and plugins are not loaded
+from the project. Installed tools and the application's Python environment are trusted.
+This intentionally uses default analyzer rules in project mode; single-file mode
+continues to honor its existing configuration. Ruff never applies fixes.
+
+Source and tool output are untrusted data, never instructions. Python validates tool
+names, argument keys, file access, and budgets even when the model requests otherwise.
+There is no unrestricted shell tool and reviewed Python code is not executed.
+
+The optional trace records bounded observations and final findings, not model reasoning.
+It may contain source excerpts. Project trace paths must end in `.json`; existing files
+are never overwritten. Trace output is a user-chosen destination, not a model-accessible tool.
+
+### Testing
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Temporary-project tests cover discovery, exact line ranges, search, exclusions, missing
+files, permissions, invalid encoding, traversal, symlink swaps, hard links, special
+files, budgets, analyzer isolation, and unsupported citations. Agent tests simulate
+related-file investigation and ensure saved observations match model-visible data.
+The tests make no live model requests. Provider-specific live behavior remains a
+separate manual check.

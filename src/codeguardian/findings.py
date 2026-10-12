@@ -1,4 +1,5 @@
 import json
+from pathlib import PurePosixPath
 
 
 def parse_findings(response_text):
@@ -29,6 +30,12 @@ def parse_findings(response_text):
         # bool is a subclass of int in Python, so check the exact type here.
         if line is not None and (type(line) is not int or line < 1):
             raise ValueError(f"Finding {number}: 'line' must be a positive integer or null.")
+        file = finding.get("file")
+        if file is not None:
+            if (not isinstance(file, str) or not file or "\\" in file or "\x00" in file
+                    or PurePosixPath(file).is_absolute()
+                    or any(part in ("", ".", "..") for part in file.split("/"))):
+                raise ValueError(f"Finding {number}: 'file' must be a project-relative path or null.")
     return review["findings"]
 
 
@@ -41,6 +48,8 @@ def print_findings(findings):
         if number > 1:
             print()
         print(f"{number}. [{finding['severity'].upper()}] {finding['category'].upper()} — {finding['title']}")
+        if "file" in finding:
+            print(f"   File: {finding['file'] or 'Project-wide'}")
         line = finding["line"] if finding["line"] is not None else "Not specified"
         print(f"   Line: {line}")
         print(f"   Description: {finding['description']}")

@@ -17,7 +17,7 @@ else:
 
 def main():
     parser = argparse.ArgumentParser(description="Review a source file with AI, Bandit, and Ruff.")
-    parser.add_argument("filename", help="Path to the file to read")
+    parser.add_argument("filename", help="Source file, or project directory with --agent")
     parser.add_argument("--provider", help="Override AI_PROVIDER for this run")
     parser.add_argument("--model", help="Override the selected provider's default model")
     parser.add_argument("--agent", action="store_true", help="Use the bounded Groq agent")
@@ -30,19 +30,24 @@ def main():
 
     path = Path(args.filename)
 
-    try:
-        contents = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        parser.exit(status=1, message=f"Error: file not found: {path}\n")
-    except (OSError, UnicodeError) as error:
-        parser.exit(status=1, message=f"Error: cannot read {path}: {error}\n")
-
-    if not contents.strip():
-        parser.exit(status=1, message="Error: the source file is empty.\n")
+    if path.is_dir():
+        if not args.agent:
+            parser.error("Project directories require --agent")
+    else:
+        try:
+            contents = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            parser.exit(status=1, message=f"Error: file not found: {path}\n")
+        except (OSError, UnicodeError) as error:
+            parser.exit(status=1, message=f"Error: cannot read {path}: {error}\n")
+        if not contents.strip():
+            parser.exit(status=1, message="Error: the source file is empty.\n")
 
     if args.agent:
         if args.trace_file and args.trace_file.resolve() == path.resolve():
             parser.error("The trace file must not overwrite the source file")
+        if path.is_dir() and args.trace_file and args.trace_file.suffix.lower() != ".json":
+            parser.error("Project trace files must use the .json extension")
         try:
             provider, model, api_key = get_settings(args.provider or "groq", args.model)
             if provider != "groq":
@@ -60,6 +65,12 @@ def main():
             print_findings(report["findings"])
         else:
             print(f"Incomplete review: {report['error']}")
+        if "coverage" in report:
+            coverage = report["coverage"]
+            print(f"\nCoverage: {len(coverage['observed_files'])} files observed; "
+                  f"{coverage['eligible_files']} eligible files. This is a selective review.")
+            for limitation in coverage["limits_reached"]:
+                print(f"Limit: {limitation}")
         if args.trace_file:
             try:
                 # Exclusive creation prevents overwriting an existing file.
