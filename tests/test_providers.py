@@ -206,8 +206,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_missing_default_and_model(self):
         del os.environ["AI_PROVIDER"]
-        with self.assertRaises(ValueError):
-            get_settings()
+        self.assertEqual(get_settings(), ("openai", "openai-default", "fake-openai-key"))
         del os.environ["GEMINI_MODEL"]
         with self.assertRaisesRegex(ValueError, "GEMINI_MODEL"):
             get_settings("gemini")

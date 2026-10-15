@@ -23,6 +23,21 @@ FINAL = {'content': '{"findings": []}', 'tool_calls': []}
 
 
 class AgentTests(unittest.TestCase):
+    def test_openai_is_default_agent_endpoint_and_finalization_disables_tools(self):
+        message = SimpleNamespace(tool_calls=[], content='{"findings": []}', reasoning='private')
+        with patch('openai.OpenAI') as factory:
+            client = factory.return_value.__enter__.return_value
+            client.chat.completions.create.return_value = SimpleNamespace(choices=[
+                SimpleNamespace(message=message, finish_reason='stop')])
+            result = request_agent_turn([], agent.TOOLS, 'configured-model', 'fake', False)
+            args = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(factory.call_args.kwargs['base_url'], 'https://api.openai.com/v1')
+        self.assertEqual(args['model'], 'configured-model')
+        self.assertEqual(args['tool_choice'], 'none')
+        self.assertFalse(args['parallel_tool_calls'])
+        self.assertNotIn('extra_body', args)
+        self.assertNotIn('private', json.dumps(result))
+
     def test_observation_feedback_and_no_automatic_tools(self):
         with patch.object(agent, 'request_agent_turn', side_effect=[tool_turn(), FINAL]) as request, \
              patch.object(agent, 'inspect_code', return_value='1: x = 1'), \
@@ -92,7 +107,7 @@ class AgentTests(unittest.TestCase):
             client = factory.return_value.__enter__.return_value
             client.chat.completions.create.return_value = SimpleNamespace(choices=[
                 SimpleNamespace(message=message, finish_reason='tool_calls')])
-            result = request_agent_turn([], agent.TOOLS, 'chosen', 'fake')
+            result = request_agent_turn([], agent.TOOLS, 'chosen', 'fake', provider='groq')
             args = client.chat.completions.create.call_args.kwargs
         self.assertEqual(args['extra_body'], {'include_reasoning': False})
         self.assertFalse(args['parallel_tool_calls'])
@@ -199,7 +214,7 @@ class ProjectAgentTests(unittest.TestCase):
         from codeguardian import project
         (self.root / 'auth.py').write_text(('a' * 150 + '\n') * 100)
         requests = []
-        def respond(messages, tools, model, api_key, allow_tools):
+        def respond(messages, tools, model, api_key, allow_tools, *, provider="openai"):
             requests.append((json.loads(json.dumps(messages)), allow_tools))
             self.assertLessEqual(agent.conversation_size(messages, tools), project.MAX_CONTEXT_CHARS)
             return self.project_turn('inspect_file', {'path': 'auth.py'}) if allow_tools else FINAL
@@ -239,7 +254,7 @@ class ProjectAgentTests(unittest.TestCase):
              patch.object(reviewer, 'get_settings', return_value=('groq', 'chosen', 'fake')), \
              patch.object(reviewer, 'run_agent', return_value=report) as run, redirect_stdout(output):
             reviewer.main()
-        run.assert_called_once_with(self.root, 'chosen', 'fake')
+        run.assert_called_once_with(self.root, 'chosen', 'fake', provider='groq')
         self.assertEqual(json.loads(trace.read_text()), report)
         self.assertIn('Partial coverage', output.getvalue())
         with patch.object(sys, 'argv', ['reviewer.py', str(self.root)]), \

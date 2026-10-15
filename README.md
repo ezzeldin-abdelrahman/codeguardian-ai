@@ -30,7 +30,7 @@ Use `samples/vulnerable_app.py` for a sample review.
 
 ## Configuration
 
-- `AI_PROVIDER`: default provider (`gemini`, `openai`, `groq`, or `openrouter`).
+- `AI_PROVIDER`: default provider (defaults to `openai`; also supports `gemini`, `groq`, `openrouter`, and `claude`).
 - `SUPPORTED_PROVIDERS`: comma-separated enabled providers; defaults to all four.
 - `GEMINI_MODEL` / `OPENAI_MODEL`: each provider's default model.
 - `GEMINI_MODELS` / `OPENAI_MODELS`: optional comma-separated lists of allowed model IDs.
@@ -125,25 +125,27 @@ JSON. The output limit is 4096 tokens. Your default provider is unchanged.
 This integration requires Anthropic API access and any applicable API credits.
 Reference: https://platform.claude.com/docs/en/api/python/messages/create
 
-## v0.4: Tool-using agent (Groq only)
+## v0.4: Tool-using agent (OpenAI or Groq)
 
 The original sequential review remains the default. Use `--agent` to let one model
 choose between `inspect_code`, `run_bandit`, and `run_ruff`:
 
 ```bash
-.venv/bin/python src/codeguardian/reviewer.py samples/vulnerable_app.py --agent --model openai/gpt-oss-120b
+.venv/bin/python src/codeguardian/reviewer.py samples/vulnerable_app.py --agent --provider groq --model openai/gpt-oss-120b
 .venv/bin/python src/codeguardian/reviewer.py samples/vulnerable_app.py --agent --trace-file review-trace.json
 ```
 
-Agent mode selects Groq unless a provider is explicitly supplied; other providers
-are rejected in agent mode. It uses GROQ_API_KEY and GROQ_MODEL and honors the
-existing provider/model allowlists. No default environment setting is changed.
+Agent mode follows `--provider`, then `AI_PROVIDER`, defaulting to OpenAI when unset.
+The supplied configuration uses `AI_PROVIDER=openai`. OpenAI uses `OPENAI_API_KEY`
+and `OPENAI_MODEL`; `--provider groq` uses `GROQ_API_KEY` and `GROQ_MODEL` instead.
+Existing provider/model allowlists apply. Other providers remain available for
+sequential review but are not supported by the agent.
 
 A tool request is a name and an empty argument object. Python binds all three
 tools to the user-selected file and executes only those named functions. The
 model receives the result as an observation before choosing its next action.
 No shell commands or alternate paths can be supplied by the model. Source code
-and observations are sent to Groq; the source is never executed.
+and observations are sent to the selected provider; the source is never executed.
 
 The loop allows five investigation turns and at most one finalization request.
 Invalid requests and failed tools consume turns. Multiple calls in one turn are
@@ -181,7 +183,7 @@ Pass a small Python project directory with `--agent`:
 .venv/bin/python src/codeguardian/reviewer.py path/to/project --agent --trace-file project-review.json
 ```
 
-Directory review uses the existing Groq agent and provider configuration. Single-file
+Directory review uses the existing OpenAI/Groq agent and provider configuration. Single-file
 sequential review and single-file `--agent` behavior remain available. Directories
 without `--agent` produce a usage error. No new dependency or framework is required.
 
@@ -276,3 +278,108 @@ files, budgets, analyzer isolation, and unsupported citations. Agent tests simul
 related-file investigation and ensure saved observations match model-visible data.
 The tests make no live model requests. Provider-specific live behavior remains a
 separate manual check.
+
+## v0.6: Git-aware review
+
+```bash
+# Existing full-project review (full is the default)
+python3 src/codeguardian/reviewer.py . --agent --mode full
+
+# Changes from HEAD to current files; diff mode implies --agent
+python3 src/codeguardian/reviewer.py . --mode diff
+
+# Current files compared with an earlier commit
+python3 src/codeguardian/reviewer.py . --mode diff --base HEAD~1
+
+# Optional trace: choose a new filename; existing files are not overwritten
+python3 src/codeguardian/reviewer.py . --mode diff --trace-file diff-review.json
+```
+
+Existing single-file commands, provider selection, and full-project investigation
+remain available. Diff review uses the existing OpenAI/Groq agent and model settings.
+It requires Git and a repository root with a local `.git` directory. Linked
+worktrees, bare repositories, subdirectory scopes, unresolved merge conflicts,
+and repositories without a valid base commit receive an error in this version.
+No additional Python dependency is required.
+
+### What is compared
+
+The base defaults to `HEAD`. The comparison is against the **current files on disk**,
+so staged and unstaged changes are included together. If an unstaged edit completely
+reverses a staged edit, there is no net change to review. `--base HEAD~1` compares
+that commit with current disk contents, not just with the latest commit.
+
+Non-ignored untracked Python files are included and labelled `untracked`. Git-ignored
+untracked files are unavailable to the diff agent, including as related context.
+Tracked files remain eligible even if an ignore pattern matches them. The existing
+security exclusions still apply to both versions. Excluded Python paths are counted;
+inaccessible, oversized, binary, or unsupported files are reported as skipped.
+An unreadable current file is never treated as a deletion.
+
+Git reads baseline regular-file blobs; the existing protected reader reads current
+Python files. Temporary `before` and `after` directories contain only approved source
+copies. Git compares those snapshots in a neutral directory without external diff
+helpers, text conversions, or repository content filters. Git subprocesses have fixed
+argument lists, a controlled environment, disabled filesystem-monitor hooks and network
+protocols, and a 30-second timeout. Output is captured to temporary files and rejected
+if it exceeds 2 MB after the command; this bounds in-memory consumption, not temporary
+disk usage during execution. Nothing is staged, committed, checked out, or modified
+in the reviewed repository.
+
+This compares source contents as stored/read; Git attribute normalization and executable
+permission-only changes are not reproduced. Rename detection is heuristic and limited
+to eligible Python snapshots. Unrecognized renames appear as addition/deletion; crossing
+the `.py` boundary appears as addition or deletion within the Python review scope.
+
+### Agent context and evidence
+
+The existing agent receives changed-file statuses, old/new paths, patches, added/removed
+line numbers, and coverage limitations in its initial user message. There is no new
+agent or unrestricted Git/shell tool. It may use `list_files`, `inspect_file`, `search_code`,
+Bandit, and Ruff to investigate changed files and related unchanged Python files.
+
+Diff hunk headers initialize separate old/current line counters. A `+` line advances
+the current counter; a `-` line advances the old counter; context advances both.
+Only locations in delivered hunks or successful tool observations may be cited.
+Deleted files may be discussed using baseline patches even when no current Python files
+remain. Their finding uses the old path and `line: null`, with old line numbers explicitly
+identified in evidence. Current files use current line numbers.
+
+Diff findings retain `category`, `severity`, `title`, `file`, `line`, `description`,
+`recommendation`, and `source`, and require a nonempty `evidence` string. Evidence should
+cite observed code or tool output and explain its connection to a change. It is printed
+in the terminal and retained in the trace. The agent is instructed to omit unrelated
+pre-existing findings, including those found by Bandit/Ruff. Relevance and evidence
+correctness are still model judgments: v0.6 adds neither semantic verification nor
+deduplication. Patches, filenames, and tool outputs are untrusted data, not instructions.
+
+### Bounds and coverage
+
+Collection permits at most 100 candidate Python paths and 2,000 inventory entries per
+baseline/current inventory. It retains the existing 100 KB per-file limit. Initial
+change context is limited to 20 changed files and 12,000 serialized characters, inside
+the existing 40,000-character conversation budget. Whole hunks/records are omitted when
+necessary; counts and limitations are shown. Collection reads and patch observations
+are separate from the existing 10 explicitly inspected/analyzed-file budget. All agent
+step, tool-observation, and search limits remain active.
+
+Safe current-file reads are fingerprinted during collection. Later tool reads refuse
+those files if their bytes changed. This helps prevent mixed-version investigations;
+it is not a transactional filesystem snapshot or an OS sandbox. Review a stable local
+checkout. Historical content can contain embedded credentials just as current code can;
+filename exclusions do not detect secrets embedded in otherwise eligible source.
+
+An empty eligible diff finishes without loading API settings or calling the LLM. If
+collection failed or skipped files, the program reports incomplete coverage instead
+of claiming a clean review. Optional traces include exactly the initial bounded change
+context supplied to the model, tool calls/observations, and final findings, without
+chain-of-thought. Traces may contain source code.
+
+Tests use temporary Git repositories for staged/unstaged/untracked changes, renames,
+deletions, bases, merge conflicts, unusual filenames, path restrictions, helper isolation,
+line parsing, context caps, and mocked agent/CLI integration. Run them with the existing
+`python -m unittest discover -s tests -v` command inside the virtual environment.
+
+OpenAI agent requests use Chat Completions tool calling, preserving the existing
+message loop. Groq-only request options are omitted for OpenAI. See the
+[official OpenAI documentation](https://developers.openai.com/api/docs/guides/function-calling).

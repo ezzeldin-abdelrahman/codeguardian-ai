@@ -3,7 +3,7 @@ import os
 
 def get_settings(provider=None, model=None):
     """Choose a provider and model, then check their configuration."""
-    provider = (provider if provider is not None else os.getenv("AI_PROVIDER", "")).strip().lower()
+    provider = (provider if provider is not None else os.getenv("AI_PROVIDER", "openai")).strip().lower()
     implemented = ("gemini", "openai", "groq", "openrouter", "claude")
     enabled = [name.strip().lower() for name in os.getenv(
         "SUPPORTED_PROVIDERS", ",".join(implemented)
@@ -152,41 +152,46 @@ def review_code(contents, provider, model, api_key):
     return text
 
 
-def request_agent_turn(messages, tools, model, api_key, allow_tools=True):
-    """Make one Groq request and return only tool decisions or final text."""
+def request_agent_turn(messages, tools, model, api_key, allow_tools=True, *, provider="openai"):
+    """Make one OpenAI or Groq request; keep only tool decisions or final text."""
+    if provider not in ("openai", "groq"):
+        raise ValueError("Agent mode supports OpenAI and Groq. Use --provider openai or groq.")
+    label = "OpenAI" if provider == "openai" else "Groq"
+    endpoint = "https://api.openai.com/v1" if provider == "openai" else "https://api.groq.com/openai/v1"
+    options = {"extra_body": {"include_reasoning": False}} if provider == "groq" else {}
     try:
         from openai import OpenAI, APIError, APIStatusError, APIConnectionError, APITimeoutError
     except ImportError:
         raise RuntimeError("Missing SDK. Run: python -m pip install -r requirements.txt") from None
     try:
-        with OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1",
+        with OpenAI(api_key=api_key, base_url=endpoint,
                     timeout=60.0, max_retries=0) as client:
             response = client.chat.completions.create(
                 model=model, messages=messages, tools=tools,
                 tool_choice="auto" if allow_tools else "none",
                 parallel_tool_calls=False,
                 max_completion_tokens=4096,
-                extra_body={"include_reasoning": False},
+                **options,
             )
     except APITimeoutError:
-        raise RuntimeError("Groq agent request timed out.") from None
+        raise RuntimeError(f"{label} agent request timed out.") from None
     except APIConnectionError:
-        raise RuntimeError("Could not connect to Groq.") from None
+        raise RuntimeError(f"Could not connect to {label}.") from None
     except APIStatusError as error:
         # Avoid retaining a raw response, which could contain reasoning or credentials.
-        raise RuntimeError(f"Groq agent API error {error.status_code}. Check access, quota, and model support.") from None
+        raise RuntimeError(f"{label} agent API error {error.status_code}. Check access, quota, and model support.") from None
     except APIError:
-        raise RuntimeError("Groq returned an unexpected agent response.") from None
+        raise RuntimeError(f"{label} returned an unexpected agent response.") from None
     if not response.choices:
-        raise RuntimeError("Groq returned no agent response.")
+        raise RuntimeError(f"{label} returned no agent response.")
     choice = response.choices[0]
     if choice.finish_reason not in ("stop", "tool_calls"):
-        raise RuntimeError("Groq did not complete the agent response (possibly an output limit or refusal).")
+        raise RuntimeError(f"{label} did not complete the agent response (possibly an output limit or refusal).")
     message = choice.message
     calls = []
     for call in message.tool_calls or []:
         if call.type != "function":
-            raise RuntimeError("Groq returned an unsupported tool request type.")
+            raise RuntimeError(f"{label} returned an unsupported tool request type.")
         calls.append({"id": call.id, "type": "function", "function": {
             "name": call.function.name, "arguments": call.function.arguments,
         }})

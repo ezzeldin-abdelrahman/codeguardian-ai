@@ -2,7 +2,7 @@ import json
 from pathlib import PurePosixPath
 
 
-def parse_findings(response_text):
+def parse_findings(response_text, *, require_evidence=False):
     """Parse JSON and check the required fields before displaying any findings."""
     try:
         review = json.loads(response_text)
@@ -26,6 +26,9 @@ def parse_findings(response_text):
         for field in ("title", "description", "recommendation"):
             if not isinstance(finding[field], str) or not finding[field].strip():
                 raise ValueError(f"Finding {number}: '{field}' must be a nonempty string.")
+        if (require_evidence or 'evidence' in finding) and (
+                not isinstance(finding.get('evidence'), str) or not finding['evidence'].strip()):
+            raise ValueError(f"Finding {number}: 'evidence' must be a nonempty string.")
         line = finding["line"]
         # bool is a subclass of int in Python, so check the exact type here.
         if line is not None and (type(line) is not int or line < 1):
@@ -54,5 +57,7 @@ def print_findings(findings):
         print(f"   Line: {line}")
         print(f"   Description: {finding['description']}")
         print(f"   Recommendation: {finding['recommendation']}")
+        if 'evidence' in finding:
+            print(f"   Evidence: {finding['evidence']}")
 
 

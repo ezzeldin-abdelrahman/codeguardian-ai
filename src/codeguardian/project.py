@@ -1,5 +1,6 @@
 """Small-project boundaries and budgets. All paths sent to the model are relative."""
 
+import hashlib
 import json
 import os
 import stat
@@ -154,6 +155,9 @@ def read_project_file(project, path):
             data = source.read(MAX_FILE_BYTES + 1)
         if len(data) > MAX_FILE_BYTES:
             raise RuntimeError('File exceeds the source-size limit.')
+        expected = project.get('snapshot_hashes', {}).get(path)
+        if expected is not None and hashlib.sha256(data).hexdigest() != expected:
+            raise RuntimeError('File changed after Git collection; start a new review.')
         return data.decode('utf-8')
     except (OSError, UnicodeError):
         raise RuntimeError('Cannot read selected file: missing, unreadable, non-UTF-8, or symlink access denied.') from None
@@ -213,7 +217,24 @@ def validate_locations(project, findings):
                 raise ValueError('A finding without a file cannot cite a line.')
             continue
         relative_parts(path)
+        if path in project.get('deleted_observed', set()):
+            if finding['line'] is not None:
+                raise ValueError('Deleted-file findings must use line:null and cite baseline lines in evidence.')
+            continue
         if path not in project['observed']:
             raise ValueError('A final finding cites a file that was not observed.')
         if finding['line'] is not None and finding['line'] not in project['observed'][path]:
             raise ValueError('A final finding cites a line that was not observed.')
+
+
+def record_change_locations(project, context):
+    """Register only patch locations delivered to the model, after context trimming."""
+    project['deleted_observed'] = set()
+    for change in context['changes']:
+        if change['status'] == 'deleted':
+            if change['hunks'] or not change['omitted_hunks']:
+                project['deleted_observed'].add(change['file'])
+        elif change['hunks'] or not change['omitted_hunks']:
+            lines = project['observed'].setdefault(change['file'], set())
+            for hunk in change['hunks']:
+                lines.update(hunk['current_lines'])

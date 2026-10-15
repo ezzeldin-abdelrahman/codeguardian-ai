@@ -1,16 +1,19 @@
 import argparse
 import json
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 if __package__:
     from .agent import run_agent
     from .findings import parse_findings, print_findings
+    from .git_changes import collect_changes
     from .providers import get_settings, review_code
     from .tools import run_bandit, run_ruff
 else:
     from agent import run_agent
     from findings import parse_findings, print_findings
+    from git_changes import collect_changes
     from providers import get_settings, review_code
     from tools import run_bandit, run_ruff
 
@@ -20,15 +23,23 @@ def main():
     parser.add_argument("filename", help="Source file, or project directory with --agent")
     parser.add_argument("--provider", help="Override AI_PROVIDER for this run")
     parser.add_argument("--model", help="Override the selected provider's default model")
-    parser.add_argument("--agent", action="store_true", help="Use the bounded Groq agent")
+    parser.add_argument("--agent", action="store_true", help="Use the bounded OpenAI/Groq agent")
+    parser.add_argument("--mode", choices=("full", "diff"), default="full", help="Review full source or Git changes")
+    parser.add_argument("--base", help="Base commit for --mode diff (default: HEAD)")
     parser.add_argument("--trace-file", type=Path, help="Save agent actions and observations as JSON")
     args = parser.parse_args()
+    if args.base is not None and args.mode != 'diff':
+        parser.error('--base requires --mode diff')
+    if args.mode == 'diff':
+        args.agent = True
     if args.trace_file and not args.agent:
         parser.error("--trace-file requires --agent")
 
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
     path = Path(args.filename)
+    if args.mode == 'diff' and not path.is_dir():
+        parser.error('Diff mode requires a Git repository root directory')
 
     if path.is_dir():
         if not args.agent:
@@ -49,13 +60,43 @@ def main():
         if path.is_dir() and args.trace_file and args.trace_file.suffix.lower() != ".json":
             parser.error("Project trace files must use the .json extension")
         try:
-            provider, model, api_key = get_settings(args.provider or "groq", args.model)
-            if provider != "groq":
-                raise ValueError("Agent mode supports only Groq. Use --provider groq.")
-            report = run_agent(path, model, api_key)
-        except (ValueError, RuntimeError) as error:
+            project = None
+            changes = None
+            if args.mode == 'diff':
+                project, changes = collect_changes(path, 'HEAD' if args.base is None else args.base)
+            if changes is not None and not changes['changed_count']:
+                partial = bool(changes['skipped_count'] or changes['limitations'])
+                report = {'status': 'incomplete' if partial else 'complete', 'findings': [],
+                          'trace': [], 'changes': changes,
+                          'error': 'No reviewable changes; some files could not be collected.' if partial else None}
+            else:
+                provider, model, api_key = get_settings(args.provider, args.model)
+                if provider not in ("openai", "groq"):
+                    raise ValueError("Agent mode supports OpenAI and Groq. Use --provider openai or groq.")
+                if changes is None:
+                    report = run_agent(path, model, api_key, provider=provider)
+                else:
+                    report = run_agent(path, model, api_key, change_context=changes, project=project, provider=provider)
+        except (ValueError, RuntimeError, OSError, UnicodeError) as error:
             parser.exit(status=1, message=f"Error: {error}\n")
-        print("=== Agent Review ===")
+        print("=== Git Diff Review ===" if args.mode == 'diff' else "=== Agent Review ===")
+        if 'changes' in report:
+            changes = report['changes']
+            print(f"Base: {changes['base']}")
+            print(f"Changed Python files: {changes['changed_count']}; "
+                  f"omitted: {changes['omitted_files']}; skipped: {changes['skipped_count']}; "
+                  f"excluded: {changes['excluded_count']}")
+            for change in changes['changes']:
+                label = ' (untracked)' if change['untracked'] else ''
+                print(f"  {change['status']}: {change['file']}{label}")
+                if change['omitted_hunks']:
+                    print(f"    Omitted patch hunks: {change['omitted_hunks']}")
+            for skipped in changes['skipped']:
+                print(f"  Skipped {skipped['file']}: {skipped['reason']}")
+            for limitation in changes['limitations']:
+                print(f"Limit: {limitation}")
+            if not changes['changed_count'] and report['status'] == 'complete':
+                print('No eligible Python changes. No LLM request was made.')
         for event in report["trace"]:
             print(f"Step {event['step']}: {event['tool']} "
                   f"({'ok' if event['observation']['ok'] else 'error'})")
