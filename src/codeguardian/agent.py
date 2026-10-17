@@ -161,7 +161,16 @@ def run_agent(file_path, model, api_key, *, change_context=None, project=None, p
                 findings = parse_findings(turn["content"] or "", require_evidence=change_context is not None)
                 fields = ("category", "severity", "title", "line", "description", "recommendation")
                 if project is not None:
-                    project_access.validate_locations(project, findings)
+                    # Drop only the findings that cite unseen code; keep the rest of the review.
+                    report['rejected_findings'] = []
+                    kept = []
+                    for item in findings:
+                        try:
+                            project_access.validate_locations(project, [item])
+                            kept.append(item)
+                        except ValueError as error:
+                            report['rejected_findings'].append({'title': item['title'], 'reason': str(error)})
+                    findings = kept
                     fields += ('file',)
                 if change_context is not None:
                     fields += ('evidence',)

@@ -1,7 +1,48 @@
 # CodeGuardian AI
 
-Reads one source file, sends its text to Gemini, OpenAI, Groq, or OpenRouter, and prints an unverified AI review.
-The source is not executed. API requests send the source to the selected provider and may cost money.
+An AI code reviewer for Python. In its main mode, an LLM agent reviews the changes
+in your last Git commit by deciding for itself which tools to use: reading code,
+searching the project, and running the Bandit (security) and Ruff (code quality)
+analyzers. The reviewed code is never executed. API requests send source code to the
+selected provider and may cost money. All findings are AI-generated and unverified.
+
+## How the agent works
+
+The LLM is the reviewer. CodeGuardian gives it a small set of tools and runs a
+bounded loop:
+
+```
+            ┌──────────────────────────────────────────────┐
+            ▼                                              │
+  Git changes ──► LLM decides ──► wants a tool? ──yes──► CodeGuardian checks the
+  (or a file)     next step            │                 request, runs the tool,
+                                       no                and returns the result
+                                       ▼
+                             final JSON findings ──► validated and printed
+```
+
+1. **Start:** the agent receives the task, for example the patches from `git diff`.
+2. **Decide:** each turn, the model either asks for one tool or gives its final answer.
+3. **Act:** CodeGuardian checks the request (known tool, valid arguments, allowed file)
+   before running it. Errors are sent back to the model as results, not hidden.
+4. **Observe:** the tool output goes back into the conversation, and the loop repeats.
+5. **Finish:** the model returns findings as JSON. CodeGuardian checks every field, and
+   in project/diff mode rejects findings that cite files or lines the agent never saw.
+
+| Mode | Tools the agent can call |
+| --- | --- |
+| Single file (`--agent`) | `inspect_code`, `run_bandit`, `run_ruff` |
+| Project or Git diff (`--mode diff`) | `list_files`, `inspect_file`, `search_code`, `run_bandit`, `run_ruff` |
+
+**Safety limits:** at most 5 steps for one file or 10 for a project, one tool call per
+turn, at most 10 files inspected, and a fixed conversation size. When a limit is
+reached, tools are switched off and the model must give its final answer. Tool output
+and source code are treated as data, never as instructions to the agent.
+
+**Providers:** the agent uses OpenAI (the default) or Groq, because it relies on their
+tool-calling API. The simpler one-shot review (no `--agent`) also supports Gemini,
+OpenRouter, and Claude; it sends the whole file in a single request, then runs Bandit
+and Ruff separately.
 
 ## Setup
 
@@ -15,7 +56,7 @@ python -m pip install -r requirements.txt
 
 If you do not already have `.env`, copy `.env.example` to `.env` and fill in the
 selected provider's API key. Keep keys out of Git; `.env` is already ignored.
-The example preserves Gemini as the default and the existing model choices.
+The example uses OpenAI as the default provider.
 Model availability depends on the provider and your account.
 
 ## Run
@@ -31,7 +72,7 @@ Use `samples/vulnerable_app.py` for a sample review.
 ## Configuration
 
 - `AI_PROVIDER`: default provider (defaults to `openai`; also supports `gemini`, `groq`, `openrouter`, and `claude`).
-- `SUPPORTED_PROVIDERS`: comma-separated enabled providers; defaults to all four.
+- `SUPPORTED_PROVIDERS`: comma-separated enabled providers; defaults to all five.
 - `GEMINI_MODEL` / `OPENAI_MODEL`: each provider's default model.
 - `GEMINI_MODELS` / `OPENAI_MODELS`: optional comma-separated lists of allowed model IDs.
   If set, the selected model (including the default) must be in its provider's list.
@@ -236,47 +277,21 @@ makes that visible. Incomplete reports retain their trace.
 ### Access boundaries
 
 Only eligible project-relative regular `.py` files can be read. Absolute paths,
-`..`, symlinks (including internal links), hard links, and special files are rejected.
-Hidden paths, Git internals, virtual environments (including directories containing
-`pyvenv.cfg`), dependency/build/cache directories, and names containing `secret`,
-`credential`, `password`, or `private_key` are excluded. `config_local.py` and
-`local_settings.py` are also excluded. This conservative policy may omit legitimate
-code; it is not a general secret detector. Credentials embedded in ordinary eligible
-source can still be sent to the provider. `.gitignore` is not interpreted in v0.5.
+`..`, symlinks, and special files are rejected, and every read checks that the
+resolved path is still inside the project folder. Hidden paths, Git internals,
+virtual environments (including directories containing `pyvenv.cfg`),
+dependency/build/cache directories, and names containing `secret`, `credential`,
+`password`, or `private_key` are excluded. `config_local.py` and `local_settings.py`
+are also excluded. This conservative policy may omit legitimate code; it is not a
+general secret detector. Credentials embedded in ordinary eligible source can still
+be sent to the provider. `.gitignore` is not interpreted.
 
-`project.py` uses POSIX directory descriptors and `O_NOFOLLOW` to open path components
-without following symlinks. It checks the selected root's identity and file size at
-read time. Unsupported platforms fail closed. macOS and Linux are the initial target
-platforms. Review a stable local project: v0.5 does not provide a transactional snapshot
-of a concurrently changing filesystem or an operating-system sandbox.
+These are simple, explainable checks, not an operating-system sandbox. CodeGuardian is
+meant for reviewing your own local projects; review a stable checkout.
 
-Project analyzer calls securely read the selected file, scan a temporary copy, and
-map findings back to the original relative path. Python subprocesses run with `-I`,
-a minimal environment, and a neutral working directory. Ruff uses `--isolated`;
-Bandit uses an empty INI file. Project-local tool settings and plugins are not loaded
-from the project. Installed tools and the application's Python environment are trusted.
-This intentionally uses default analyzer rules in project mode; single-file mode
-continues to honor its existing configuration. Ruff never applies fixes.
+Project analyzer calls first check that the requested file is eligible, then run
+Bandit or Ruff on it and map findings back to the relative path. Ruff never applies fixes.
 
-Source and tool output are untrusted data, never instructions. Python validates tool
-names, argument keys, file access, and budgets even when the model requests otherwise.
-There is no unrestricted shell tool and reviewed Python code is not executed.
-
-The optional trace records bounded observations and final findings, not model reasoning.
-It may contain source excerpts. Project trace paths must end in `.json`; existing files
-are never overwritten. Trace output is a user-chosen destination, not a model-accessible tool.
-
-### Testing
-
-```bash
-.venv/bin/python -m unittest discover -s tests -v
-```
-
-Temporary-project tests cover discovery, exact line ranges, search, exclusions, missing
-files, permissions, invalid encoding, traversal, symlink swaps, hard links, special
-files, budgets, analyzer isolation, and unsupported citations. Agent tests simulate
-related-file investigation and ensure saved observations match model-visible data.
-The tests make no live model requests. Provider-specific live behavior remains a
 separate manual check.
 
 ## v0.6: Git-aware review
@@ -285,11 +300,11 @@ separate manual check.
 # Existing full-project review (full is the default)
 python3 src/codeguardian/reviewer.py . --agent --mode full
 
-# Changes from HEAD to current files; diff mode implies --agent
+# Review the last commit (plus any uncommitted edits); diff mode implies --agent
 python3 src/codeguardian/reviewer.py . --mode diff
 
-# Current files compared with an earlier commit
-python3 src/codeguardian/reviewer.py . --mode diff --base HEAD~1
+# Review only uncommitted changes
+python3 src/codeguardian/reviewer.py . --mode diff --base HEAD
 
 # Optional trace: choose a new filename; existing files are not overwritten
 python3 src/codeguardian/reviewer.py . --mode diff --trace-file diff-review.json
@@ -297,39 +312,26 @@ python3 src/codeguardian/reviewer.py . --mode diff --trace-file diff-review.json
 
 Existing single-file commands, provider selection, and full-project investigation
 remain available. Diff review uses the existing OpenAI/Groq agent and model settings.
-It requires Git and a repository root with a local `.git` directory. Linked
-worktrees, bare repositories, subdirectory scopes, unresolved merge conflicts,
-and repositories without a valid base commit receive an error in this version.
+It requires Git and the repository root directory. Repositories with unresolved merge
+conflicts, or without a valid base commit, receive an error.
 No additional Python dependency is required.
 
 ### What is compared
 
-The base defaults to `HEAD`. The comparison is against the **current files on disk**,
-so staged and unstaged changes are included together. If an unstaged edit completely
-reverses a staged edit, there is no net change to review. `--base HEAD~1` compares
-that commit with current disk contents, not just with the latest commit.
+The base defaults to `HEAD~1`, so a normal run reviews **the last commit**. The
+comparison is against the current files on disk, so any staged or unstaged edits made
+since then are included too. Use `--base HEAD` to review only uncommitted work, or any
+other commit (for example `--base main`).
 
-Non-ignored untracked Python files are included and labelled `untracked`. Git-ignored
-untracked files are unavailable to the diff agent, including as related context.
-Tracked files remain eligible even if an ignore pattern matches them. The existing
-security exclusions still apply to both versions. Excluded Python paths are counted;
-inaccessible, oversized, binary, or unsupported files are reported as skipped.
-An unreadable current file is never treated as a deletion.
-
-Git reads baseline regular-file blobs; the existing protected reader reads current
-Python files. Temporary `before` and `after` directories contain only approved source
-copies. Git compares those snapshots in a neutral directory without external diff
-helpers, text conversions, or repository content filters. Git subprocesses have fixed
-argument lists, a controlled environment, disabled filesystem-monitor hooks and network
-protocols, and a 30-second timeout. Output is captured to temporary files and rejected
-if it exceeds 2 MB after the command; this bounds in-memory consumption, not temporary
-disk usage during execution. Nothing is staged, committed, checked out, or modified
-in the reviewed repository.
-
-This compares source contents as stored/read; Git attribute normalization and executable
-permission-only changes are not reproduced. Rename detection is heuristic and limited
-to eligible Python snapshots. Unrecognized renames appear as addition/deletion; crossing
-the `.py` boundary appears as addition or deletion within the Python review scope.
+CodeGuardian runs `git diff <base> -- '*.py'` to list changed Python files and then
+asks Git for each file's patch. New files must be added with `git add` before they
+appear. The same filename exclusions as project mode apply (for example, a changed
+`secrets.py` is counted as excluded and never sent). Files that are now symlinks or
+too large are reported as skipped. Git commands use fixed argument lists (no shell),
+a 30-second timeout, and `--no-ext-diff --no-textconv` so the repository cannot make
+Git run external diff programs. Nothing is staged, committed, or modified.
+Only review repositories you trust: Git still applies a repository's own configured
+content filters when it reads files.
 
 ### Agent context and evidence
 
@@ -355,19 +357,10 @@ deduplication. Patches, filenames, and tool outputs are untrusted data, not inst
 
 ### Bounds and coverage
 
-Collection permits at most 100 candidate Python paths and 2,000 inventory entries per
-baseline/current inventory. It retains the existing 100 KB per-file limit. Initial
-change context is limited to 20 changed files and 12,000 serialized characters, inside
-the existing 40,000-character conversation budget. Whole hunks/records are omitted when
-necessary; counts and limitations are shown. Collection reads and patch observations
-are separate from the existing 10 explicitly inspected/analyzed-file budget. All agent
+Initial change context is limited to 20 changed files and 12,000 serialized
+characters, inside the existing 40,000-character conversation budget. Whole
+hunks/records are omitted when necessary; counts and limitations are shown. All agent
 step, tool-observation, and search limits remain active.
-
-Safe current-file reads are fingerprinted during collection. Later tool reads refuse
-those files if their bytes changed. This helps prevent mixed-version investigations;
-it is not a transactional filesystem snapshot or an OS sandbox. Review a stable local
-checkout. Historical content can contain embedded credentials just as current code can;
-filename exclusions do not detect secrets embedded in otherwise eligible source.
 
 An empty eligible diff finishes without loading API settings or calling the LLM. If
 collection failed or skipped files, the program reports incomplete coverage instead
@@ -375,8 +368,8 @@ of claiming a clean review. Optional traces include exactly the initial bounded 
 context supplied to the model, tool calls/observations, and final findings, without
 chain-of-thought. Traces may contain source code.
 
-Tests use temporary Git repositories for staged/unstaged/untracked changes, renames,
-deletions, bases, merge conflicts, unusual filenames, path restrictions, helper isolation,
+Tests use temporary Git repositories for staged/unstaged changes, renames,
+deletions, bases, merge conflicts, unusual filenames, path restrictions,
 line parsing, context caps, and mocked agent/CLI integration. Run them with the existing
 `python -m unittest discover -s tests -v` command inside the virtual environment.
 

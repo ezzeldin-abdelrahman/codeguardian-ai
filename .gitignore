@@ -18,3 +18,6 @@ venv/
 # Python testing/cache
 .pytest_cache/
 .coverage
+
+# Agent traces (may contain source code)
+*trace*.json

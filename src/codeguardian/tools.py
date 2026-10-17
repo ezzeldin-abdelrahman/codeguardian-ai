@@ -1,8 +1,6 @@
 """Run local analysis tools and return CodeGuardian finding dictionaries."""
 
 import json
-import os
-import tempfile
 import subprocess
 import sys
 from pathlib import Path
@@ -22,29 +20,27 @@ def inspect_code(file_path):
     return "\n".join(f"{number}: {line}" for number, line in enumerate(contents.splitlines(), 1))
 
 
-def run_bandit(file_path, *, project=None, isolated=False):
+def analyze_project_file(analyzer, project, file_path):
+    """Check that the agent asked for an eligible file, then analyze it in place."""
+    project_access.claim_file(project, file_path)
+    project_access.read_project_file(project, file_path)
+    findings = analyzer(project["root"] / file_path)
+    for finding in findings:
+        finding["file"] = file_path
+    return project_access.bound_observation(
+        {"ok": True, "path": file_path, "findings": findings, "truncated": False})
+
+
+def run_bandit(file_path, *, project=None):
     """Return security findings; raise RuntimeError if Bandit cannot scan the file."""
     if project is not None:
-        project_access.claim_file(project, file_path)
-        contents = project_access.read_project_file(project, file_path)
-        with tempfile.TemporaryDirectory(prefix="codeguardian-") as directory:
-            snapshot = Path(directory) / "source.py"
-            snapshot.write_text(contents, encoding="utf-8")
-            findings = run_bandit(snapshot, isolated=True)
-        for finding in findings:
-            finding["file"] = file_path
-        return project_access.bound_observation(
-            {"ok": True, "path": file_path, "findings": findings, "truncated": False})
+        return analyze_project_file(run_bandit, project, file_path)
     path = Path(file_path).resolve()
     if not path.is_file():
         raise RuntimeError(f"Bandit requires an existing source file: {path}")
-    command = [sys.executable] + (["-I"] if isolated else []) + ["-m", "bandit", "-f", "json"]
-    if isolated:
-        command += ["--ini", os.devnull]
-    command += ["--", str(path)]
-    options = {"cwd": str(path.parent), "env": {"PATH": os.defpath, "HOME": str(path.parent)}} if isolated else {}
+    command = [sys.executable, "-m", "bandit", "-f", "json", "--", str(path)]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=60, **options)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
         raise RuntimeError("Bandit timed out after 60 seconds.") from None
     except OSError as error:
@@ -88,30 +84,17 @@ def run_bandit(file_path, *, project=None, isolated=False):
     return findings
 
 
-def run_ruff(file_path, *, project=None, isolated=False):
+def run_ruff(file_path, *, project=None):
     """Return lint findings. Ruff findings use our initial quality/low mapping."""
     if project is not None:
-        project_access.claim_file(project, file_path)
-        contents = project_access.read_project_file(project, file_path)
-        with tempfile.TemporaryDirectory(prefix="codeguardian-") as directory:
-            snapshot = Path(directory) / "source.py"
-            snapshot.write_text(contents, encoding="utf-8")
-            findings = run_ruff(snapshot, isolated=True)
-        for finding in findings:
-            finding["file"] = file_path
-        return project_access.bound_observation(
-            {"ok": True, "path": file_path, "findings": findings, "truncated": False})
+        return analyze_project_file(run_ruff, project, file_path)
     path = Path(file_path).resolve()
     if not path.is_file():
         raise RuntimeError(f"Ruff requires an existing source file: {path}")
-    command = [sys.executable] + (["-I"] if isolated else []) + [
-        "-m", "ruff", "check", "--no-fix", "--no-fix-only", "--no-cache", "--output-format", "json"]
-    if isolated:
-        command += ["--isolated"]
-    command += ["--", str(path)]
-    options = {"cwd": str(path.parent), "env": {"PATH": os.defpath, "HOME": str(path.parent)}} if isolated else {}
+    command = [sys.executable, "-m", "ruff", "check", "--no-fix", "--no-cache",
+               "--output-format", "json", "--", str(path)]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=60, **options)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
         raise RuntimeError("Ruff timed out after 60 seconds.") from None
     except OSError as error:

@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--model", help="Override the selected provider's default model")
     parser.add_argument("--agent", action="store_true", help="Use the bounded OpenAI/Groq agent")
     parser.add_argument("--mode", choices=("full", "diff"), default="full", help="Review full source or Git changes")
-    parser.add_argument("--base", help="Base commit for --mode diff (default: HEAD)")
+    parser.add_argument("--base", help="Base commit for --mode diff (default: HEAD~1, the last commit)")
     parser.add_argument("--trace-file", type=Path, help="Save agent actions and observations as JSON")
     args = parser.parse_args()
     if args.base is not None and args.mode != 'diff':
@@ -63,7 +63,7 @@ def main():
             project = None
             changes = None
             if args.mode == 'diff':
-                project, changes = collect_changes(path, 'HEAD' if args.base is None else args.base)
+                project, changes = collect_changes(path, 'HEAD~1' if args.base is None else args.base)
             if changes is not None and not changes['changed_count']:
                 partial = bool(changes['skipped_count'] or changes['limitations'])
                 report = {'status': 'incomplete' if partial else 'complete', 'findings': [],
@@ -87,8 +87,7 @@ def main():
                   f"omitted: {changes['omitted_files']}; skipped: {changes['skipped_count']}; "
                   f"excluded: {changes['excluded_count']}")
             for change in changes['changes']:
-                label = ' (untracked)' if change['untracked'] else ''
-                print(f"  {change['status']}: {change['file']}{label}")
+                print(f"  {change['status']}: {change['file']}")
                 if change['omitted_hunks']:
                     print(f"    Omitted patch hunks: {change['omitted_hunks']}")
             for skipped in changes['skipped']:
@@ -104,6 +103,8 @@ def main():
                 print(f"  {event['observation']['error']}")
         if report["status"] == "complete":
             print_findings(report["findings"])
+            for rejected in report.get("rejected_findings", []):
+                print(f"Removed finding '{rejected['title']}': {rejected['reason']}")
         else:
             print(f"Incomplete review: {report['error']}")
         if "coverage" in report:

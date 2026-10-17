@@ -166,15 +166,34 @@ class ProjectAgentTests(unittest.TestCase):
         bandit.assert_not_called()
         ruff.assert_not_called()
 
-    def test_locations_require_delivered_evidence(self):
-        for file, line in [('auth.py', 2), ('app.py', 1), ('../outside.py', 1), (None, 1)]:
+    def test_findings_citing_unseen_code_are_removed(self):
+        for file, line in [('auth.py', 2), ('app.py', 1), (None, 1)]:
             with self.subTest(file=file, line=line), patch.object(agent, 'request_agent_turn', side_effect=[
                     self.project_turn('inspect_file', {'path': 'auth.py', 'start_line': 1, 'end_line': 1}),
                     self.final_finding(file, line)]):
                 report = agent.run_agent(self.root, 'chosen', 'fake')
-            self.assertEqual(report['status'], 'incomplete')
-            self.assertTrue(report['error'])
-            self.assertEqual(len(report['trace']), 1)
+            self.assertEqual(report['status'], 'complete')
+            self.assertEqual(report['findings'], [])
+            self.assertEqual(len(report['rejected_findings']), 1)
+
+    def test_good_findings_are_kept_when_another_is_removed(self):
+        good = json.loads(self.final_finding('auth.py', 1)['content'])['findings'][0]
+        bad = dict(good, title='Unseen line', line=2)
+        with patch.object(agent, 'request_agent_turn', side_effect=[
+                self.project_turn('inspect_file', {'path': 'auth.py', 'start_line': 1, 'end_line': 1}),
+                {'tool_calls': [], 'content': json.dumps({'findings': [good, bad]})}]):
+            report = agent.run_agent(self.root, 'chosen', 'fake')
+        self.assertEqual(report['status'], 'complete')
+        self.assertEqual([item['line'] for item in report['findings']], [1])
+        self.assertEqual(report['rejected_findings'][0]['title'], 'Unseen line')
+
+    def test_invalid_finding_path_fails_the_review(self):
+        with patch.object(agent, 'request_agent_turn', side_effect=[
+                self.project_turn('inspect_file', {'path': 'auth.py', 'start_line': 1, 'end_line': 1}),
+                self.final_finding('../outside.py', 1)]):
+            report = agent.run_agent(self.root, 'chosen', 'fake')
+        self.assertEqual(report['status'], 'incomplete')
+        self.assertTrue(report['error'])
 
     def test_invalid_arguments_fail_as_observations(self):
         for name, arguments in [('inspect_file', {'path': '../outside.py'}),

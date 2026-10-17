@@ -1,15 +1,11 @@
 """Small-project boundaries and budgets. All paths sent to the model are relative."""
 
-import hashlib
 import json
 import os
-import stat
 from pathlib import Path, PurePosixPath
 
 MAX_PROJECT_STEPS = 10
 MAX_FILES = 100
-MAX_ENTRIES = 2000
-MAX_DEPTH = 20
 MAX_FILE_BYTES = 100_000
 MAX_INSPECTED_FILES = 10
 MAX_INSPECT_LINES = 100
@@ -45,127 +41,49 @@ def relative_parts(path):
     return parts
 
 
-def open_root(root):
-    """Open each directory without following symlinks (POSIX, including macOS/Linux)."""
-    if not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY'):
-        raise RuntimeError('Secure project access requires POSIX O_NOFOLLOW support.')
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    descriptor = os.open('/', flags)
-    try:
-        for part in Path(root).parts[1:]:
-            child = os.open(part, flags, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = child
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
 def create_project(directory):
-    """Build a bounded eligibility list without reading source contents."""
-    original = Path(directory).absolute()
-    if original.is_symlink():
-        raise ValueError('The selected project directory must not be a symlink.')
-    root = original.resolve(strict=True)
+    """List eligible Python files without reading their contents."""
+    root = Path(directory).resolve()
+    if not root.is_dir():
+        raise ValueError('The selected project directory does not exist.')
     if any(excluded_name(part) for part in root.parts[1:]):
         raise ValueError('The selected project root is inside an excluded directory.')
     project = {'root': root, 'files': [], 'limits_reached': [], 'inspected': set(),
                'search_results': 0, 'observed': {}}
-    descriptor = open_root(root)
-    try:
-        info = os.fstat(descriptor)
-        project['root_identity'] = (info.st_dev, info.st_ino)
-        # Walk through directory descriptors so a symlink swap cannot redirect traversal.
-        pending = [('', 0)]
-        entries_seen = 0
-        while pending:
-            relative, depth = pending.pop()
-            current = os.dup(descriptor)
-            try:
-                for part in relative.split('/') if relative else []:
-                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
-                    os.close(current)
-                    current = child
-                # Virtual environments can have arbitrary directory names.
-                try:
-                    os.stat('pyvenv.cfg', dir_fd=current, follow_symlinks=False)
-                except FileNotFoundError:
-                    pass
-                else:
-                    continue
-                with os.scandir(current) as entries:
-                    for entry in entries:
-                        entries_seen += 1
-                        if entries_seen > MAX_ENTRIES:
-                            project['limits_reached'].append('Directory entry limit reached; discovery is partial.')
-                            pending.clear()
-                            break
-                        if excluded_name(entry.name) or entry.is_symlink():
-                            continue
-                        name = f'{relative}/{entry.name}' if relative else entry.name
-                        if entry.is_dir(follow_symlinks=False):
-                            if depth < MAX_DEPTH:
-                                pending.append((name, depth + 1))
-                            elif 'Directory depth limit reached.' not in project['limits_reached']:
-                                project['limits_reached'].append('Directory depth limit reached.')
-                        elif name.endswith('.py') and entry.is_file(follow_symlinks=False):
-                            info = entry.stat(follow_symlinks=False)
-                            if info.st_size > MAX_FILE_BYTES or info.st_nlink != 1:
-                                continue
-                            if len(project['files']) == MAX_FILES:
-                                project['limits_reached'].append('Eligible file limit reached; discovery is partial.')
-                                pending.clear()
-                                break
-                            project['files'].append(name)
-            except OSError:
-                project['limits_reached'].append('A directory could not be read; discovery is partial.')
-            finally:
-                os.close(current)
-        project['files'].sort()
-    finally:
-        os.close(descriptor)
+    # os.walk does not follow directory symlinks by default.
+    for folder, subfolders, filenames in os.walk(root):
+        # Skip excluded folders and virtual environments (they contain pyvenv.cfg).
+        subfolders[:] = sorted(name for name in subfolders if not excluded_name(name)
+                               and not (Path(folder) / name / 'pyvenv.cfg').exists())
+        for name in sorted(filenames):
+            file = Path(folder) / name
+            if excluded_name(name) or not name.endswith('.py') or file.is_symlink() or not file.is_file():
+                continue
+            if file.stat().st_size > MAX_FILE_BYTES:
+                continue
+            if len(project['files']) == MAX_FILES:
+                project['limits_reached'].append('Eligible file limit reached; discovery is partial.')
+                project['files'].sort()
+                return project
+            project['files'].append(file.relative_to(root).as_posix())
+    project['files'].sort()
     return project
 
 
 def read_project_file(project, path):
-    """Read at most 100 KB; reject symlinks at every component during opening."""
-    parts = relative_parts(path)
+    """Read an eligible file, refusing anything that leads outside the project."""
+    relative_parts(path)
     if path not in project['files']:
         raise ValueError('File is missing, excluded, too large, or outside the eligible-file list.')
-    directory = None
-    file_descriptor = None
+    file = project['root'] / path
     try:
-        directory = open_root(project['root'])
-        info = os.fstat(directory)
-        if (info.st_dev, info.st_ino) != project['root_identity']:
-            raise RuntimeError('The project directory changed; start a new review.')
-        for part in parts[:-1]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-            os.close(directory)
-            directory = child
-        file_descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        info = os.fstat(file_descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise RuntimeError('Only regular files without hard links are eligible.')
-        if info.st_size > MAX_FILE_BYTES:
+        if file.is_symlink() or not file.resolve().is_relative_to(project['root']) or not file.is_file():
+            raise RuntimeError('Cannot read selected file: missing, not a regular file, or outside the project.')
+        if file.stat().st_size > MAX_FILE_BYTES:
             raise RuntimeError('File exceeds the source-size limit.')
-        with os.fdopen(file_descriptor, 'rb') as source:
-            file_descriptor = None
-            data = source.read(MAX_FILE_BYTES + 1)
-        if len(data) > MAX_FILE_BYTES:
-            raise RuntimeError('File exceeds the source-size limit.')
-        expected = project.get('snapshot_hashes', {}).get(path)
-        if expected is not None and hashlib.sha256(data).hexdigest() != expected:
-            raise RuntimeError('File changed after Git collection; start a new review.')
-        return data.decode('utf-8')
+        return file.read_text(encoding='utf-8')
     except (OSError, UnicodeError):
-        raise RuntimeError('Cannot read selected file: missing, unreadable, non-UTF-8, or symlink access denied.') from None
-    finally:
-        if file_descriptor is not None:
-            os.close(file_descriptor)
-        if directory is not None:
-            os.close(directory)
+        raise RuntimeError('Cannot read selected file: missing, unreadable, or non-UTF-8.') from None
 
 
 def claim_file(project, path):

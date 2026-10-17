@@ -77,30 +77,17 @@ class ProjectToolTests(unittest.TestCase):
             self.assertEqual(result['matches'], [])
             self.assertTrue(result['errors'])
 
-    def test_directory_symlink_swap_and_root_symlink(self):
-        package = self.root / 'package'
-        package.mkdir()
-        (package / 'a.py').write_text('pass')
-        current = project.create_project(self.root)
-        package.rename(self.root / 'moved')
-        package.symlink_to(self.root / 'moved', target_is_directory=True)
-        with self.assertRaises(RuntimeError):
-            tools.inspect_file(current, 'package/a.py')
-        with self.assertRaisesRegex(ValueError, 'symlink'):
-            project.create_project(package)
-
-    def test_hard_links_and_non_regular_files(self):
-        os.link(self.root / 'auth.py', self.root / 'linked.py')
+    def test_non_regular_files(self):
         os.mkfifo(self.root / 'pipe.py')
         current = project.create_project(self.root)
-        self.assertEqual(current['files'], ['app.py'])
+        self.assertEqual(current['files'], ['app.py', 'auth.py'])
         (self.root / 'app.py').unlink()
         os.mkfifo(self.root / 'app.py')
         with self.assertRaises(RuntimeError):
             tools.inspect_file(current, 'app.py')
 
     def test_permissions_and_invalid_encoding(self):
-        with patch('codeguardian.project.os.open', side_effect=PermissionError('denied')):
+        with patch('codeguardian.project.Path.read_text', side_effect=PermissionError('denied')):
             with self.assertRaisesRegex(RuntimeError, 'unreadable'):
                 tools.inspect_file(self.project, 'app.py')
         (self.root / 'app.py').write_bytes(b'\xff')
@@ -128,8 +115,6 @@ class ProjectToolTests(unittest.TestCase):
             limited = project.create_project(self.root)
             self.assertEqual(len(limited['files']), 1)
             self.assertTrue(limited['limits_reached'])
-        with patch.object(project, 'MAX_ENTRIES', 1):
-            self.assertTrue(project.create_project(self.root)['limits_reached'])
         (self.root / 'large.py').write_text('x' * (project.MAX_FILE_BYTES + 1))
         self.assertNotIn('large.py', project.create_project(self.root)['files'])
         (self.root / 'app.py').write_text('x' * (project.MAX_FILE_BYTES + 1))
@@ -151,7 +136,7 @@ class ProjectToolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 project.validate_locations(self.project, [finding])
 
-    def test_analyzers_use_isolated_snapshots(self):
+    def test_analyzers_scan_the_requested_project_file(self):
         bandit_report = {'errors': [], 'results': [{
             'issue_severity': 'LOW', 'test_id': 'B101', 'test_name': 'assert_used',
             'line_number': 1, 'issue_text': 'Use of assert detected.'}]}
@@ -159,13 +144,7 @@ class ProjectToolTests(unittest.TestCase):
         for run, tool_name, output in [(tools.run_bandit, 'bandit', bandit_report),
                                        (tools.run_ruff, 'ruff', ruff_report)]:
             def fake_run(command, **options):
-                self.assertIn('-I', command)
-                self.assertIn('--ini' if tool_name == 'bandit' else '--isolated', command)
-                snapshot = Path(command[-1])
-                self.assertNotEqual(snapshot.parent, self.root)
-                self.assertEqual(snapshot.read_text(), (self.root / 'app.py').read_text())
-                self.assertEqual(options['cwd'], str(snapshot.parent))
-                self.assertNotIn('PYTHONPATH', options['env'])
+                self.assertEqual(Path(command[-1]), self.root / 'app.py')
                 return subprocess.CompletedProcess(command, 1, json.dumps(output), '')
             with self.subTest(tool=tool_name), patch('codeguardian.tools.subprocess.run', side_effect=fake_run):
                 result = run('app.py', project=self.project)
@@ -175,7 +154,6 @@ class ProjectToolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tools.run_bandit('../outside.py', project=self.project)
             execute.assert_not_called()
-
 
     def test_empty_file_and_optional_finding_location(self):
         (self.root / 'empty.py').write_text('')
