@@ -440,3 +440,46 @@ verification marks the finding `supported` with Bandit agreeing. LLM output vari
 a single run can occasionally differ. A real run is saved in
 [examples/sample-output.txt](examples/sample-output.txt) and
 [examples/sample-trace.json](examples/sample-trace.json).
+
+## v0.8: Evaluation
+
+```bash
+python evaluation/evaluate.py --cases sql_vulnerable,sql_safe   # small trial
+python evaluation/evaluate.py                                   # all 12 cases (about 10-30 cents)
+python evaluation/evaluate.py --score-only                      # rescore saved results, no API calls
+```
+
+**Benchmark.** `evaluation/cases/` has 12 small hand-written cases: one vulnerable and
+one safe example for SQL injection, command injection, hard-coded credentials, unsafe
+deserialization (`pickle`), path traversal, and weak password hashing (MD5). The
+deserialization case spans two files. The path traversal case is a Git-diff case: its
+unchanged file has an old MD5 checksum that a diff review should not report. Each safe
+file explains in a comment why it is safe (for example, a parameterized query or a
+`resolve()` check). Ground truth is in `evaluation/labels.json`, written by hand; no LLM
+decides it. The case code is never executed. Because the samples are intentionally
+vulnerable, exclude `evaluation/cases/` when you run Bandit or Ruff on this repository.
+
+**How it runs.** Each case is reviewed once by the normal `reviewer.py` CLI with
+`--verify`. Raw traces and printed output are saved in `evaluation/results/raw/`.
+**Before** scores all candidate findings; **after** keeps only findings verification
+marked `supported`. Both come from the same agent run, so differences are caused by
+verification alone.
+
+**Matching rules.**
+- Only `security` and `bug` findings are scored (the benchmark does not label quality or testing issues).
+- A keyword list maps each finding's title and description to an issue type (`TYPE_KEYWORDS` in `evaluate.py`).
+- A finding matches a label when the type and file are the same and the line is within **±3 lines**.
+- Matching is one-to-one: each label is matched by its closest finding, so duplicates count as false positives.
+- Unmatched findings are false positives (FP); unmatched labels are false negatives (FN).
+
+**Metrics.** Precision = TP / (TP + FP), recall = TP / (TP + FN), and F1. When a
+denominator is zero the value is shown as "n/a" (for example, precision when there are
+no findings); F1 is 0 when both precision and recall are 0. The report also counts
+supported/uncertain/unsupported results, correct findings rejected by verification, and
+verification tokens (agent tokens are not tracked). A failed or incomplete review is
+listed as failed and left out of the metrics; it is never counted as a clean result.
+`results.json` holds every number; `summary.md` is a readable table with the false
+positives and missed issues to investigate.
+
+Limitations: 12 cases are enough to show the method, not to make strong claims, and
+LLM results vary between runs.

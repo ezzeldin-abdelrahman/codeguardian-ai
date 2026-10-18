@@ -24,3 +24,6 @@ venv/
 
 # Committed example trace
 !examples/sample-trace.json
+
+# Evaluation outputs (raw results may contain source code)
+evaluation/results/

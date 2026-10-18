@@ -1,0 +1,17 @@
+{
+  "_note": "Hand-written ground truth. Lines are 1-based. Safe cases have no labels. Diff cases use line numbers from the after/ version.",
+  "cases": {
+    "sql_vulnerable": [{"type": "sql_injection", "file": "users.py", "line": 6}],
+    "sql_safe": [],
+    "command_vulnerable": [{"type": "command_injection", "file": "network.py", "line": 6}],
+    "command_safe": [],
+    "hardcoded_vulnerable": [{"type": "hardcoded_credentials", "file": "database.py", "line": 3}],
+    "hardcoded_safe": [],
+    "deserialization_vulnerable": [{"type": "unsafe_deserialization", "file": "sessions.py", "line": 7}],
+    "deserialization_safe": [],
+    "path_vulnerable_diff": [{"type": "path_traversal", "file": "files.py", "line": 12}],
+    "path_safe": [],
+    "crypto_vulnerable": [{"type": "insecure_crypto", "file": "accounts.py", "line": 5}],
+    "crypto_safe": []
+  }
+}
