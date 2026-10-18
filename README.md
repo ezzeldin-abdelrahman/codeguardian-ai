@@ -376,3 +376,67 @@ line parsing, context caps, and mocked agent/CLI integration. Run them with the 
 OpenAI agent requests use Chat Completions tool calling, preserving the existing
 message loop. Groq-only request options are omitted for OpenAI. See the
 [official OpenAI documentation](https://developers.openai.com/api/docs/guides/function-calling).
+
+## v0.7: Evidence verification
+
+```bash
+# Opt-in: one extra API call per finding (at most 10), so it is off by default
+python3 src/codeguardian/reviewer.py . --mode diff --verify
+python3 src/codeguardian/reviewer.py . --agent --verify
+```
+
+After the agent finishes, `--verify` checks each finding separately. The original
+findings are not changed; results are added to the report under `verification` and
+printed in an "Evidence Verification" section (`F001` is finding 1, and so on). This
+is a fixed pipeline in `verifier.py`, not a second agent: the verifier has no tools.
+
+For each finding:
+
+1. **Check the location (code).** The file must be an eligible project file (the same
+   rules as `inspect_file`) and the line must exist. Otherwise the result is
+   `unsupported` and no API call is made.
+2. **Collect evidence (code).** The cited line ±10 lines (at most 40 lines and
+   4,000 characters), plus the diff patch for that file in diff mode. Deleted files
+   are checked against their patch only.
+3. **Correlate tools (code).** Bandit (for `security` findings) and Ruff (for
+   `quality`/`bug` findings) are run locally on the file; results within 3 lines count
+   as corroboration.
+4. **Ask the model (one call).** It receives only the evidence above and returns
+   `{"status", "reason", "evidence_lines"}`. Source and tool output are untrusted data.
+5. **Apply fixed rules (code).** The model's answer is not trusted on its own:
+
+| Situation | Final status |
+| --- | --- |
+| Bad file/line location | `unsupported` |
+| Malformed finding, project-wide finding, API error, timeout, or invalid JSON | `uncertain` |
+| Model says `supported` but cites no line from the supplied source | `uncertain` |
+| Model says `supported` for a finding with no line, and no tool agrees | `uncertain` |
+| Model says `unsupported` but Bandit/Ruff flags the same area | `uncertain` (conflict) |
+| Otherwise | the model's status |
+
+Only lines that were actually supplied to the model can appear as `evidence`, so
+locations are never invented. `independent_corroboration` is true only when Bandit or
+Ruff agrees: a second LLM call agreeing with the first is not independent proof.
+Each result records token usage and latency when the provider reports them, and the
+terminal prints the totals. Findings beyond the first 10 are marked `uncertain`
+("not verified: limit reached"). Findings already removed by the agent's location
+check are not verified. Verification supports OpenAI and Groq, like the agent.
+
+## Demo: v0.6 and v0.7 end to end
+
+```bash
+# One real review of a tiny two-commit repository (about a cent of API credit)
+python examples/demo_diff_review.py
+
+# The same check as an optional live test (skipped unless enabled)
+CODEGUARDIAN_LIVE_TEST=1 python -m unittest tests.test_live_demo -v
+```
+
+The demo builds a temporary repository: the first commit has a safe `app.py` and a
+`helper.py` with an old `eval` bug; the second commit adds an SQL injection to `app.py`.
+It runs `--mode diff --verify` and checks the trace: the base is `HEAD~1`, only `app.py`
+is reviewed, the SQL injection is found, the old `helper.py` bug is not reported, and
+verification marks the finding `supported` with Bandit agreeing. LLM output varies, so
+a single run can occasionally differ. A real run is saved in
+[examples/sample-output.txt](examples/sample-output.txt) and
+[examples/sample-trace.json](examples/sample-trace.json).

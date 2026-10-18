@@ -1,4 +1,5 @@
 import os
+import time
 
 
 def get_settings(provider=None, model=None):
@@ -150,6 +151,39 @@ def review_code(contents, provider, model, api_key):
     if not text or not text.strip():
         raise RuntimeError("The provider returned no review text. The response may have been blocked.")
     return text
+
+
+def request_verification(messages, model, api_key, *, provider="openai"):
+    """Make one OpenAI or Groq request without tools; return its text, token usage, and latency."""
+    if provider not in ("openai", "groq"):
+        raise ValueError("Verification supports OpenAI and Groq. Use --provider openai or groq.")
+    label = "OpenAI" if provider == "openai" else "Groq"
+    endpoint = "https://api.openai.com/v1" if provider == "openai" else "https://api.groq.com/openai/v1"
+    try:
+        from openai import OpenAI, APIError, APIStatusError, APIConnectionError, APITimeoutError
+    except ImportError:
+        raise RuntimeError("Missing SDK. Run: python -m pip install -r requirements.txt") from None
+    started = time.perf_counter()
+    try:
+        with OpenAI(api_key=api_key, base_url=endpoint, timeout=60.0, max_retries=0) as client:
+            response = client.chat.completions.create(model=model, messages=messages, max_completion_tokens=400)
+    except APITimeoutError:
+        raise RuntimeError(f"{label} verification request timed out.") from None
+    except APIConnectionError:
+        raise RuntimeError(f"Could not connect to {label}.") from None
+    except APIStatusError as error:
+        raise RuntimeError(f"{label} verification API error {error.status_code}.") from None
+    except APIError:
+        raise RuntimeError(f"{label} returned an unexpected verification response.") from None
+    latency_ms = round((time.perf_counter() - started) * 1000)
+    if not response.choices or not response.choices[0].message.content:
+        raise RuntimeError(f"{label} returned no verification text.")
+    # Not every provider reports token usage, so these may be None.
+    usage = getattr(response, "usage", None)
+    return {"content": response.choices[0].message.content,
+            "usage": {"input_tokens": getattr(usage, "prompt_tokens", None),
+                      "output_tokens": getattr(usage, "completion_tokens", None),
+                      "latency_ms": latency_ms}}
 
 
 def request_agent_turn(messages, tools, model, api_key, allow_tools=True, *, provider="openai"):

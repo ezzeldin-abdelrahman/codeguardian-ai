@@ -21,3 +21,6 @@ venv/
 
 # Agent traces (may contain source code)
 *trace*.json
+
+# Committed example trace
+!examples/sample-trace.json

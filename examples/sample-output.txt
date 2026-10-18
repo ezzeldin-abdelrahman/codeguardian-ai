@@ -1,0 +1,26 @@
+Real run on 2026-10-17 with OpenAI gpt-5.4-mini (the demo repository from demo_diff_review.py).
+Command: python src/codeguardian/reviewer.py demo-repo --mode diff --verify --trace-file trace.json
+The full trace is in sample-trace.json.
+
+=== Git Diff Review ===
+Base: 05b55f977a8cf89b25a452ed07fc3313785d0144
+Changed Python files: 1; omitted: 0; skipped: 0; excluded: 0
+  modified: app.py
+Step 1: inspect_file (error)
+  end_line is beyond the end of this file.
+Step 2: inspect_file (error)
+  end_line is beyond the end of this file.
+Step 3: inspect_file (ok)
+1. [HIGH] SECURITY — SQL injection in `find_user` query construction
+   File: app.py
+   Line: 11
+   Description: The new `find_user(name)` function interpolates untrusted input directly into an SQL string with an f-string. If `name` contains quotes or SQL fragments, an attacker could alter the query and potentially read or modify data. I could verify this pattern in the shown code, but I did not execute the function.
+   Recommendation: Use a parameterized query instead of string interpolation, e.g. `connection.execute("SELECT * FROM users WHERE name = ?", (name,))`, and consider closing the connection explicitly or using a context manager.
+   Evidence: Observed in app.py lines 9-12: `query = f"SELECT * FROM users WHERE name = '{name}'"` followed by `connection.execute(query)`, which directly embeds the `name` argument into SQL.
+
+=== Evidence Verification ===
+F001: SUPPORTED [confirmed by bandit] - The function builds SQL with an f-string that directly inserts `name` into the query string, which is a classic SQL injection pattern when `name` is untrusted input. The query is then executed without parameterization.
+Verification calls: 1; tokens in/out: 501/66; time: 1.8s
+
+Coverage: 1 files observed; 2 eligible files. This is a selective review.
+Limit: A requested project tool failed or was refused.

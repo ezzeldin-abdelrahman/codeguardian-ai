@@ -273,7 +273,9 @@ class ProjectAgentTests(unittest.TestCase):
              patch.object(reviewer, 'get_settings', return_value=('groq', 'chosen', 'fake')), \
              patch.object(reviewer, 'run_agent', return_value=report) as run, redirect_stdout(output):
             reviewer.main()
-        run.assert_called_once_with(self.root, 'chosen', 'fake', provider='groq')
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs['project']['files'], ['app.py', 'auth.py'])
+        self.assertEqual(run.call_args.kwargs['provider'], 'groq')
         self.assertEqual(json.loads(trace.read_text()), report)
         self.assertIn('Partial coverage', output.getvalue())
         with patch.object(sys, 'argv', ['reviewer.py', str(self.root)]), \

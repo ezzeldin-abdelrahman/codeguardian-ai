@@ -8,14 +8,29 @@ if __package__:
     from .agent import run_agent
     from .findings import parse_findings, print_findings
     from .git_changes import collect_changes
+    from .project import create_project
     from .providers import get_settings, review_code
     from .tools import run_bandit, run_ruff
+    from .verifier import verify_findings
 else:
     from agent import run_agent
     from findings import parse_findings, print_findings
     from git_changes import collect_changes
+    from project import create_project
     from providers import get_settings, review_code
     from tools import run_bandit, run_ruff
+    from verifier import verify_findings
+
+
+def print_verification(verification):
+    """Show one line per finding (F001 is finding 1 above) and the cost totals."""
+    print("\n=== Evidence Verification ===")
+    for item in verification["results"]:
+        tools = f" [confirmed by {', '.join(item['corroborating_tools'])}]" if item["corroborating_tools"] else ""
+        print(f"{item['finding_id']}: {item['verification_status'].upper()}{tools} - {item['reason']}")
+    print(f"Verification calls: {verification['llm_calls']}; tokens in/out: "
+          f"{verification['input_tokens']}/{verification['output_tokens']}; "
+          f"time: {verification['latency_ms'] / 1000:.1f}s")
 
 
 def main():
@@ -27,6 +42,8 @@ def main():
     parser.add_argument("--mode", choices=("full", "diff"), default="full", help="Review full source or Git changes")
     parser.add_argument("--base", help="Base commit for --mode diff (default: HEAD~1, the last commit)")
     parser.add_argument("--trace-file", type=Path, help="Save agent actions and observations as JSON")
+    parser.add_argument("--verify", action="store_true",
+                        help="Check each agent finding against source evidence (extra API calls)")
     args = parser.parse_args()
     if args.base is not None and args.mode != 'diff':
         parser.error('--base requires --mode diff')
@@ -34,6 +51,8 @@ def main():
         args.agent = True
     if args.trace_file and not args.agent:
         parser.error("--trace-file requires --agent")
+    if args.verify and not args.agent:
+        parser.error("--verify requires --agent or --mode diff")
 
     load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -74,9 +93,15 @@ def main():
                 if provider not in ("openai", "groq"):
                     raise ValueError("Agent mode supports OpenAI and Groq. Use --provider openai or groq.")
                 if changes is None:
-                    report = run_agent(path, model, api_key, provider=provider)
+                    # Create the project here so verification can use the same file list.
+                    project = create_project(path) if path.is_dir() else None
+                    report = run_agent(path, model, api_key, project=project, provider=provider)
                 else:
                     report = run_agent(path, model, api_key, change_context=changes, project=project, provider=provider)
+                if args.verify and report["status"] == "complete" and report["findings"]:
+                    report["verification"] = verify_findings(
+                        report["findings"], path, model, api_key, provider=provider,
+                        project=project, change_context=changes)
         except (ValueError, RuntimeError, OSError, UnicodeError) as error:
             parser.exit(status=1, message=f"Error: {error}\n")
         print("=== Git Diff Review ===" if args.mode == 'diff' else "=== Agent Review ===")
@@ -105,6 +130,8 @@ def main():
             print_findings(report["findings"])
             for rejected in report.get("rejected_findings", []):
                 print(f"Removed finding '{rejected['title']}': {rejected['reason']}")
+        if "verification" in report:
+            print_verification(report["verification"])
         else:
             print(f"Incomplete review: {report['error']}")
         if "coverage" in report:
