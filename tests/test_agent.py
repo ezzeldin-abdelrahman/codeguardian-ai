@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -24,19 +25,63 @@ FINAL = {'content': '{"findings": []}', 'tool_calls': []}
 
 class AgentTests(unittest.TestCase):
     def test_openai_is_default_agent_endpoint_and_finalization_disables_tools(self):
-        message = SimpleNamespace(tool_calls=[], content='{"findings": []}', reasoning='private')
-        with patch('openai.OpenAI') as factory:
+        reasoning = SimpleNamespace(type='reasoning', summary='private')
+        response = SimpleNamespace(status='completed', output=[reasoning], output_text='{"findings": []}', usage=None)
+        with patch('openai.OpenAI') as factory, patch.dict(os.environ, {'OPENAI_REASONING_EFFORT': ''}):
             client = factory.return_value.__enter__.return_value
-            client.chat.completions.create.return_value = SimpleNamespace(choices=[
-                SimpleNamespace(message=message, finish_reason='stop')])
+            client.responses.create.return_value = response
             result = request_agent_turn([], agent.TOOLS, 'configured-model', 'fake', False)
-            args = client.chat.completions.create.call_args.kwargs
+            args = client.responses.create.call_args.kwargs
         self.assertEqual(factory.call_args.kwargs['base_url'], 'https://api.openai.com/v1')
         self.assertEqual(args['model'], 'configured-model')
         self.assertEqual(args['tool_choice'], 'none')
         self.assertFalse(args['parallel_tool_calls'])
-        self.assertNotIn('extra_body', args)
+        self.assertNotIn('reasoning', args)
+        self.assertEqual(args['tools'][0]['name'], 'inspect_code')
+        self.assertFalse(args['tools'][0]['strict'])
+        self.assertEqual(result['content'], '{"findings": []}')
         self.assertNotIn('private', json.dumps(result))
+        client.chat.completions.create.assert_not_called()
+
+    def test_openai_tool_call_conversation_and_reasoning_setting(self):
+        call = SimpleNamespace(type='function_call', call_id='c1', name='inspect_code', arguments='{}')
+        response = SimpleNamespace(status='completed', output=[call], output_text='', usage=None)
+        messages = [{'role': 'system', 'content': 'rules'}, {'role': 'user', 'content': 'review'},
+                    {'role': 'assistant', 'content': None, 'tool_calls': [
+                        {'id': 'c0', 'type': 'function', 'function': {'name': 'run_ruff', 'arguments': '{}'}}]},
+                    {'role': 'tool', 'tool_call_id': 'c0', 'content': '{"ok": true}'}]
+        with patch('openai.OpenAI') as factory, patch.dict(os.environ, {'OPENAI_REASONING_EFFORT': 'none'}):
+            client = factory.return_value.__enter__.return_value
+            client.responses.create.return_value = response
+            result = request_agent_turn(messages, agent.TOOLS, 'chosen', 'fake')
+            args = client.responses.create.call_args.kwargs
+        self.assertEqual(args['reasoning'], {'effort': 'none'})
+        self.assertEqual(args['input'][2], {'type': 'function_call', 'call_id': 'c0', 'name': 'run_ruff',
+                                             'arguments': '{}'})
+        self.assertEqual(args['input'][3], {'type': 'function_call_output', 'call_id': 'c0', 'output': '{"ok": true}'})
+        self.assertEqual(result['tool_calls'][0]['id'], 'c1')
+        self.assertIsNone(result['content'])
+
+    def test_complete_agent_review_without_verify_is_not_called_incomplete(self):
+        from codeguardian import reviewer
+        report = {'status': 'complete', 'findings': [], 'trace': [], 'error': None}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            reviewer.print_agent_report(report, 'full')
+        self.assertIn('No findings', output.getvalue())
+        self.assertNotIn('Incomplete review', output.getvalue())
+
+    def test_api_errors_show_the_short_message_without_the_key(self):
+        import httpx
+        from openai import APIStatusError
+        response = httpx.Response(400, request=httpx.Request('POST', 'https://example.com'))
+        error = APIStatusError('raw', response=response,
+                               body={'message': 'Tools are not supported for this model; key secret-key'})
+        with patch('openai.OpenAI', side_effect=error), self.assertRaises(RuntimeError) as caught:
+            request_agent_turn([], agent.TOOLS, 'chosen', 'secret-key')
+        self.assertIn('400: Tools are not supported', str(caught.exception))
+        self.assertNotIn('secret-key', str(caught.exception))
+        self.assertIn('[REDACTED]', str(caught.exception))
 
     def test_observation_feedback_and_no_automatic_tools(self):
         with patch.object(agent, 'request_agent_turn', side_effect=[tool_turn(), FINAL]) as request, \

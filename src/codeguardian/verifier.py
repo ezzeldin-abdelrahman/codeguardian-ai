@@ -7,14 +7,9 @@ one LLM call, with no tools, and plain rules below make the final decision.
 import json
 from pathlib import Path
 
-if __package__:
-    from . import project as project_access
-    from .providers import request_verification
-    from .tools import run_bandit, run_ruff
-else:
-    import project as project_access
-    from providers import request_verification
-    from tools import run_bandit, run_ruff
+from . import project as project_access
+from .providers import add_usage, request_verification
+from .tools import run_bandit, run_ruff
 
 MAX_VERIFIED_FINDINGS = 10
 CONTEXT_RADIUS = 10
@@ -43,27 +38,43 @@ def result(finding_id, status, reason, evidence=(), tools=(), usage=None):
             "independent_corroboration": bool(tools), "usage": usage}
 
 
+def read_cited_file(finding, file_path, project):
+    """Return (project path, file text). The text is None for a deleted file. Raise ValueError if not allowed."""
+    if project is None:
+        return None, Path(file_path).read_text(encoding="utf-8")
+    path = finding["file"]
+    if path is None:
+        raise ValueError("Project-wide finding: there is no specific code location to check.")
+    project_access.relative_parts(path)   # the same file rules as the agent's tools
+    if path in project.get("deleted_observed", set()):
+        return path, None
+    if path not in project["files"]:
+        raise ValueError("The cited file does not exist or is outside the allowed project scope.")
+    try:
+        return path, project_access.read_project_file(project, path)
+    except RuntimeError as error:
+        raise ValueError(str(error)) from None
+
+
+def source_window(source, line, space_used):
+    """The lines around the cited line (or the start of the file), within the size limits."""
+    if line is None:
+        start, end = 1, min(len(source), MAX_CONTEXT_LINES)
+    else:
+        start = max(1, line - CONTEXT_RADIUS)
+        end = min(len(source), line + CONTEXT_RADIUS, start + MAX_CONTEXT_LINES - 1)
+    lines = {}
+    for number in range(start, end + 1):
+        space_used += len(source[number - 1]) + 8
+        if space_used > MAX_EVIDENCE_CHARS:
+            break
+        lines[number] = source[number - 1]
+    return lines
+
+
 def collect_evidence(finding, file_path, project, change_context):
     """Return (lines, source_kind, patch) for the finding, or raise ValueError if its location is invalid."""
-    line = finding["line"]
-    if project is None:
-        path = None
-        text = Path(file_path).read_text(encoding="utf-8")
-    else:
-        path = finding["file"]
-        if path is None:
-            raise ValueError("Project-wide finding: there is no specific code location to check.")
-        project_access.relative_parts(path)
-        if path in project.get("deleted_observed", set()):
-            text = None
-        elif path not in project["files"]:
-            raise ValueError("The cited file does not exist or is outside the allowed project scope.")
-        else:
-            try:
-                text = project_access.read_project_file(project, path)
-            except RuntimeError as error:
-                raise ValueError(str(error)) from None
-
+    path, text = read_cited_file(finding, file_path, project)
     hunks = [hunk for change in (change_context or {}).get("changes", [])
              if path is not None and path in (change["file"], change["old_file"]) for hunk in change["hunks"]]
     patch = "".join(hunk["patch"] for hunk in hunks)[:MAX_EVIDENCE_CHARS // 2]
@@ -73,23 +84,11 @@ def collect_evidence(finding, file_path, project, change_context):
         if not removed:
             raise ValueError("The deleted file has no delivered patch to check.")
         return {number: None for number in removed}, "diff", patch
-
     source = text.splitlines()
+    line = finding["line"]
     if line is not None and line > len(source):
         raise ValueError(f"Line {line} does not exist; the file has {len(source)} lines.")
-    if line is None:
-        start, end = 1, min(len(source), MAX_CONTEXT_LINES)
-    else:
-        start = max(1, line - CONTEXT_RADIUS)
-        end = min(len(source), line + CONTEXT_RADIUS, start + MAX_CONTEXT_LINES - 1)
-    lines = {}
-    used = len(patch)
-    for number in range(start, end + 1):
-        used += len(source[number - 1]) + 8
-        if used > MAX_EVIDENCE_CHARS:
-            break
-        lines[number] = source[number - 1]
-    return lines, "code", patch
+    return source_window(source, line, len(patch)), "code", patch
 
 
 def correlate_tools(finding, file_path, project, cache):
@@ -160,47 +159,55 @@ def line_ranges(numbers):
     return ranges
 
 
+def is_malformed(finding, project):
+    line = finding.get("line") if isinstance(finding, dict) else None
+    return (not isinstance(finding, dict) or not isinstance(finding.get("title"), str)
+            or finding.get("category") not in ("bug", "security", "quality", "testing")
+            or not (line is None or (type(line) is int and line > 0))
+            or (project is not None and "file" not in finding))
+
+
+def verify_one(finding_id, finding, file_path, model, api_key, provider, project, change_context, cache, totals):
+    """Check one finding: location, evidence, tools, one LLM call, then the fixed rules."""
+    if is_malformed(finding, project):
+        return result(finding_id, "uncertain", "Malformed finding; it could not be verified.")
+    try:
+        lines, kind, patch = collect_evidence(finding, file_path, project, change_context)
+    except (ValueError, OSError, UnicodeError) as error:
+        # Project-wide claims are not wrong, just not checkable against a location.
+        status = "uncertain" if finding.get("file") is None and project is not None else "unsupported"
+        return result(finding_id, status, str(error))
+    matches, tool_errors = correlate_tools(finding, file_path, project, cache)
+    tools = sorted({m["tool"] for m in matches})
+    totals["llm_calls"] += 1
+    try:
+        answer, usage = ask_model(finding, lines, patch, matches, model, api_key, provider)
+    except (ValueError, RuntimeError) as error:
+        add_usage(totals, None)  # the failed call's token usage is unknown, not zero
+        return result(finding_id, "uncertain", f"Verification unavailable: {error}", tools=tools)
+    add_usage(totals, usage)
+    totals["latency_ms"] += usage.get("latency_ms") or 0
+
+    status, reason, cited = decide_status(finding, answer, lines, matches, kind)
+    file = str(finding.get("file", file_path if project is None else None))
+    evidence = [{"file": file, "line_start": start, "line_end": end, "source": kind}
+                for start, end in line_ranges(cited)]
+    evidence += [{"file": file, "line_start": m["line"], "line_end": m["line"], "source": m["tool"]} for m in matches]
+    if tool_errors:
+        reason += " Tool errors: " + "; ".join(tool_errors)
+    return result(finding_id, status, reason, evidence, tools, usage)
+
+
 def verify_findings(findings, file_path, model, api_key, *, provider="openai", project=None, change_context=None):
     """Return one verification result per finding plus call, token, and time totals."""
+    cache = {}  # Bandit/Ruff results per file, so each tool runs once per file
+    totals = {"llm_calls": 0, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "latency_ms": 0}
     results = []
-    cache = {}
-    totals = {"llm_calls": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0}
     for number, finding in enumerate(findings, 1):
         finding_id = f"F{number:03}"
         if number > MAX_VERIFIED_FINDINGS:
             results.append(result(finding_id, "uncertain", "Not verified: verification limit reached."))
-            continue
-        if (not isinstance(finding, dict) or not isinstance(finding.get("title"), str)
-                or finding.get("category") not in ("bug", "security", "quality", "testing")
-                or not (finding.get("line") is None or (type(finding.get("line")) is int and finding["line"] > 0))
-                or (project is not None and "file" not in finding)):
-            results.append(result(finding_id, "uncertain", "Malformed finding; it could not be verified."))
-            continue
-        try:
-            lines, kind, patch = collect_evidence(finding, file_path, project, change_context)
-        except (ValueError, OSError, UnicodeError) as error:
-            # Project-wide claims are not wrong, just not checkable against a location.
-            status = "uncertain" if finding.get("file") is None and project is not None else "unsupported"
-            results.append(result(finding_id, status, str(error)))
-            continue
-        matches, tool_errors = correlate_tools(finding, file_path, project, cache)
-        try:
-            answer, usage = ask_model(finding, lines, patch, matches, model, api_key, provider)
-        except (ValueError, RuntimeError) as error:
-            results.append(result(finding_id, "uncertain", f"Verification unavailable: {error}",
-                                  tools=sorted({m["tool"] for m in matches})))
-            continue
-        finally:
-            totals["llm_calls"] += 1
-        for key in ("input_tokens", "output_tokens", "latency_ms"):
-            totals[key] += usage.get(key) or 0
-        status, reason, cited = decide_status(finding, answer, lines, matches, kind)
-        file = finding.get("file", file_path if project is None else None)
-        evidence = [{"file": str(file), "line_start": start, "line_end": end, "source": kind}
-                    for start, end in line_ranges(cited)]
-        evidence += [{"file": str(file), "line_start": m["line"], "line_end": m["line"], "source": m["tool"]}
-                     for m in matches]
-        if tool_errors:
-            reason += " Tool errors: " + "; ".join(tool_errors)
-        results.append(result(finding_id, status, reason, evidence, sorted({m["tool"] for m in matches}), usage))
+        else:
+            results.append(verify_one(finding_id, finding, file_path, model, api_key, provider, project,
+                                      change_context, cache, totals))
     return {"results": results, **totals}

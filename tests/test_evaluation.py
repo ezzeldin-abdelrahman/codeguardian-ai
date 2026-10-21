@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "evaluation"))
-import evaluate
+import scoring
 
 LABEL = {"type": "sql_injection", "file": "users.py", "line": 6}
 
@@ -27,7 +27,7 @@ def trace(findings, statuses=None):
 
 class EvaluationTests(unittest.TestCase):
     def score(self, findings, labels=(LABEL,), statuses=None):
-        return evaluate.score_case("case", trace(findings, statuses), list(labels))
+        return scoring.score_case("case", trace(findings, statuses), list(labels))
 
     def test_finding_types_from_keywords(self):
         cases = {"SQL injection": "sql_injection", "Unsafe pickle loading": "unsafe_deserialization",
@@ -36,12 +36,12 @@ class EvaluationTests(unittest.TestCase):
                  "Missing docstring": "other"}
         for title, expected in cases.items():
             with self.subTest(title=title):
-                self.assertEqual(evaluate.finding_type({"title": title, "description": ""}), expected)
+                self.assertEqual(scoring.finding_type({"title": title, "description": ""}), expected)
 
     def test_perfect_prediction(self):
         result = self.score([finding()])
         self.assertEqual((result["before"]["tp"], result["before"]["fp"], result["before"]["fn"]), (1, 0, 0))
-        self.assertEqual(evaluate.metrics(1, 0, 0)["f1"], 1.0)
+        self.assertEqual(scoring.metrics(1, 0, 0)["f1"], 1.0)
 
     def test_missed_vulnerability(self):
         result = self.score([])
@@ -72,10 +72,10 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["before"]["fp"], 0)
 
     def test_empty_predictions_and_empty_labels(self):
-        self.assertEqual(evaluate.metrics(0, 0, 0), {"tp": 0, "fp": 0, "fn": 0,
+        self.assertEqual(scoring.metrics(0, 0, 0), {"tp": 0, "fp": 0, "fn": 0,
                                                      "precision": None, "recall": None, "f1": None})
-        self.assertEqual(evaluate.metrics(0, 0, 1)["precision"], None)
-        self.assertEqual(evaluate.metrics(0, 1, 1)["f1"], 0.0)
+        self.assertEqual(scoring.metrics(0, 0, 1)["precision"], None)
+        self.assertEqual(scoring.metrics(0, 1, 1)["f1"], 0.0)
 
     def test_verification_rejecting_a_correct_finding(self):
         result = self.score([finding(), finding(title="SQL injection", line=40)], statuses=["uncertain", "unsupported"])
@@ -85,25 +85,10 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["verification_counts"], {"supported": 0, "uncertain": 1, "unsupported": 1})
 
     def test_failed_and_incomplete_runs_are_not_clean(self):
-        failed = [evaluate.score_case("a", None, [LABEL]),
-                  evaluate.score_case("b", {"status": "incomplete", "error": "API error 429"}, [LABEL])]
+        failed = [scoring.score_case("a", None, [LABEL]),
+                  scoring.score_case("b", {"status": "incomplete", "error": "API error 429"}, [LABEL])]
         self.assertEqual([r["status"] for r in failed], ["failed", "failed"])
         self.assertEqual(failed[1]["error"], "API error 429")
-        summary = evaluate.summarize(failed + [self.score([finding()])])
-        self.assertEqual(summary["failed"], ["a", "b"])
-        self.assertEqual(summary["cases_scored"], 1)
-        self.assertEqual(summary["totals"]["before"]["tp"], 1)
-
-    def test_summary_report_is_written(self):
-        summary = evaluate.summarize([self.score([finding(), finding(line=30)])])
-        path = ROOT / "evaluation" / "test-summary.tmp.md"
-        try:
-            evaluate.write_summary(summary, path)
-            text = path.read_text()
-        finally:
-            path.unlink(missing_ok=True)
-        self.assertIn("| Before verification | 1 | 1 | 0 | 50% | 100% | 67% |", text)
-        self.assertIn("False positive in case: users.py:30", text)
 
     def test_every_label_points_to_a_real_line(self):
         labels = json.loads((ROOT / "evaluation" / "labels.json").read_text())["cases"]

@@ -1,216 +1,219 @@
-"""v0.8: measure CodeGuardian's accuracy on hand-labeled cases, before and after verification.
+"""v0.8-v0.9: benchmark CodeGuardian's quality, speed, and cost on hand-labeled cases.
 
-    python evaluation/evaluate.py                       # run all 12 cases (real API calls)
-    python evaluation/evaluate.py --cases sql_vulnerable,sql_safe
-    python evaluation/evaluate.py --score-only          # rescore saved results, no API calls
+    python evaluation/evaluate.py --smoke                     # 2 cases, all modes: a cheap first check
+    python evaluation/evaluate.py --modes all --models openai:gpt-6-luna,groq:openai/gpt-oss-120b \\
+                                  --repeats 2 --budget 1.00
+    python evaluation/evaluate.py --modes static_only         # free: no LLM calls
+    python evaluation/evaluate.py --score-only                # rebuild the latest report, no API calls
 
-Each case is reviewed once with --verify. "Before" scores every candidate finding;
-"after" keeps only findings that verification marked supported. Both use the same
-agent run, so any difference comes from verification alone. Case code is only read
-and scanned, never executed.
+Without --modes, it runs agentic and agentic_verified (the v0.8 before/after comparison).
+The files work together like this:
+    modes.py    runs one review mode on one case (only existing CodeGuardian code)
+    scoring.py  matches findings to labels and calculates metrics and cost
+    report.py   writes summary.md
+Case code is only read and scanned, never executed.
 """
 
 import argparse
+import hashlib
 import json
+import os
 import subprocess
 import sys
-import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+import modes as mode_runner  # also makes the codeguardian package importable
+from codeguardian import agent, project, verifier
+from codeguardian.providers import get_settings
+from report import write_report
+from scoring import LINE_TOLERANCE, aggregate, load_pricing, load_rows, review_cost
+
 HERE = Path(__file__).resolve().parent
-REVIEWER = HERE.parent / "src" / "codeguardian" / "reviewer.py"
-LINE_TOLERANCE = 3
-
-# The first matching keyword decides the issue type, so more specific types come first.
-TYPE_KEYWORDS = [
-    ("sql_injection", ("sql",)),
-    ("unsafe_deserialization", ("pickle", "deserializ", "yaml.load")),
-    ("path_traversal", ("traversal", "path injection")),
-    ("command_injection", ("command injection", "os.system", "shell", "subprocess")),
-    ("insecure_crypto", ("md5", "sha1", "weak hash", "password hash", "cryptograph")),
-    ("hardcoded_credentials", ("hardcoded", "hard-coded", "credential", "password", "secret")),
-]
+# Used by --budget before the first real cost is known. Deliberately on the high side.
+FIRST_CASE_ESTIMATE = 0.05
+SMOKE_CASES = ["sql_vulnerable", "sql_safe"]
 
 
-def finding_type(finding):
-    """Map a finding's free text to one of the benchmark issue types (or "other")."""
-    text = (finding.get("title", "") + " " + finding.get("description", "")).lower()
-    for issue_type, keywords in TYPE_KEYWORDS:
-        if any(keyword in text for keyword in keywords):
-            return issue_type
-    return "other"
+class Budget:
+    """Approximate spending limit: it stops before a case whose expected cost would exceed the limit.
 
-
-def match(predictions, labels):
-    """One-to-one matching: same type, same file, line within LINE_TOLERANCE.
-
-    Each label takes the closest unused prediction. Leftover predictions are false
-    positives, so duplicates of one issue count only once as correct.
+    A case's cost is only known after it runs, so one case can still go over the limit.
     """
-    used = set()
-    missed = []
-    for label in labels:
-        candidates = [(abs(p["line"] - label["line"]), index) for index, p in enumerate(predictions)
-                      if index not in used and p["type"] == label["type"] and p["file"] == label["file"]
-                      and p["line"] is not None and abs(p["line"] - label["line"]) <= LINE_TOLERANCE]
-        if candidates:
-            used.add(min(candidates)[1])
-        else:
-            missed.append(label)
-    false_positives = [p for index, p in enumerate(predictions) if index not in used]
-    return {"tp": len(used), "fp": len(false_positives), "fn": len(missed),
-            "matched": sorted(predictions[i]["id"] for i in used),
-            "false_positives": false_positives, "missed": missed}
+
+    def __init__(self, limit):
+        self.limit, self.spent, self.cases = limit, 0.0, 0
+
+    def allows_next_case(self):
+        if self.limit is None:
+            return True
+        expected = self.spent / self.cases if self.cases else FIRST_CASE_ESTIMATE
+        return self.spent + expected <= self.limit
+
+    def record(self, cost):
+        if cost is not None:
+            self.spent += cost
+            self.cases += 1
 
 
-def metrics(tp, fp, fn):
-    """Precision and recall are None ("n/a") when their denominator is zero."""
-    precision = tp / (tp + fp) if tp + fp else None
-    recall = tp / (tp + fn) if tp + fn else None
-    if precision is None or recall is None:
-        f1 = None
+def model_slug(model_key):
+    return model_key.replace(":", "__").replace("/", "_")
+
+
+def git_commit():
+    def git(*arguments):
+        return subprocess.run(["git", "-C", str(HERE.parent), *arguments], capture_output=True, text=True).stdout.strip()
+    return git("rev-parse", "--short", "HEAD") + (" (with uncommitted changes)" if git("status", "--porcelain") else "")
+
+
+def dataset_version():
+    """A short hash of the labels and every case file, so results can be tied to the exact dataset."""
+    digest = hashlib.sha256((HERE / "labels.json").read_bytes())
+    for path in sorted((HERE / "cases").rglob("*.py")):
+        digest.update(str(path.relative_to(HERE)).encode() + path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def run_benchmark(case_ids, modes, model_keys, repeats, run_directory, budget, pause, settings_for, prices):
+    """Run every (model, repeat, case) and save one raw JSON file per mode result."""
+    for model_index, model_key in enumerate(model_keys):
+        provider, model, api_key = settings_for(model_key)
+        for repeat in range(1, repeats + 1):
+            for case_id in case_ids:
+                case = mode_runner.case_info(case_id)
+                # Bandit/Ruff do not depend on the model, so static_only runs once per repeat.
+                selected = [m for m in modes if m != "static_only" or model_index == 0]
+                needs_llm = [m for m in selected if m in mode_runner.LLM_MODES
+                             and not mode_runner.unsupported_reason(m, case)]
+                skipped = needs_llm and not budget.allows_next_case()
+                print(f"[{model_key} run {repeat}] {case_id}" + (" (LLM modes skipped: budget)" if skipped else ""),
+                      flush=True)
+                to_run = [m for m in selected if not (skipped and m in needs_llm)]
+                results = mode_runner.run_modes(case, to_run, provider, model, api_key)
+                for mode in needs_llm if skipped else []:
+                    results[mode] = dict(mode_runner.new_result("skipped"), error="Budget limit reached.")
+                if not skipped and needs_llm:
+                    # The verified result already includes the agent's usage, so count the larger one only.
+                    agent_result = results.get("agentic_verified") or results.get("agentic")
+                    spent = [review_cost(r["usage"], prices.get(model_key))[0]
+                             for r in (results.get("llm_only"), agent_result) if r]
+                    budget.record(None if None in spent else sum(spent))
+                for mode, result in results.items():
+                    owner = "none" if mode == "static_only" else model_key
+                    folder = run_directory / "raw" / model_slug(owner) / mode
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / f"{case_id}-run{repeat}.json").write_text(json.dumps(
+                        {"model": owner, "mode": mode, "case": case_id, "repeat": repeat, "result": result},
+                        indent=2, default=str))
+                if pause and needs_llm and not skipped:
+                    time.sleep(pause)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Benchmark CodeGuardian on the labeled cases.")
+    parser.add_argument("--modes", help="Comma-separated: " + ", ".join(mode_runner.MODES) + ", or all "
+                        "(default: agentic,agentic_verified)")
+    parser.add_argument("--models", help="Comma-separated provider:model, e.g. openai:gpt-6-luna "
+                        "(default: the provider and model in .env)")
+    parser.add_argument("--cases", help="Comma-separated case names (default: all)")
+    parser.add_argument("--repeats", type=int, default=1, help="Run every case this many times")
+    parser.add_argument("--smoke", action="store_true", help="Quick check: 2 cases, all modes, 1 repeat")
+    parser.add_argument("--budget", type=float, help="Approximate maximum estimated spend in USD")
+    parser.add_argument("--pause", type=float, default=0, help="Seconds to wait between cases (for free-tier rate limits)")
+    parser.add_argument("--score-only", nargs="?", const="latest", metavar="RUN",
+                        help="Rebuild the report of a saved run (default: the latest) without API calls")
+    parser.add_argument("--results", type=Path, default=HERE / "results", help="Folder for benchmark runs")
+    return parser, parser.parse_args()
+
+
+def saved_run(parser, results, name):
+    """The folder of a saved run: the newest one, or the one the user named."""
+    runs = sorted(path for path in results.glob("*") if (path / "run_info.json").exists())
+    if not runs:
+        parser.error(f"No saved runs in {results}")
+    return runs[-1] if name == "latest" else results / name
+
+
+def choose_plan(parser, args, labels, prices):
+    """Decide which modes, cases, repeats, and models to run, and check them before any API call."""
+    if args.modes == "all" or (args.smoke and not args.modes):
+        modes = list(mode_runner.MODES)
     else:
-        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return {"tp": tp, "fp": fp, "fn": fn, "precision": precision, "recall": recall, "f1": f1}
+        modes = (args.modes or "agentic,agentic_verified").split(",")
+    case_ids = SMOKE_CASES if args.smoke else (args.cases.split(",") if args.cases else list(labels))
+    repeats = 1 if args.smoke else args.repeats
+    unknown = [m for m in modes if m not in mode_runner.MODES] + [c for c in case_ids if c not in labels]
+    if unknown:
+        parser.error(f"Unknown mode or case: {', '.join(unknown)}")
+    if repeats < 1:
+        parser.error("--repeats must be at least 1")
 
-
-def score_case(case_id, trace, labels):
-    """Score one saved review. A failed or incomplete review is never counted as clean."""
-    if not trace or trace.get("status") != "complete":
-        return {"case": case_id, "status": "failed",
-                "error": (trace or {}).get("error") or "No review result was saved."}
-    statuses = {item["finding_id"]: item["verification_status"]
-                for item in trace.get("verification", {}).get("results", [])}
-    predictions = []
-    for number, finding in enumerate(trace["findings"], 1):
-        # Only security and bug findings are scored; the benchmark does not label quality or testing.
-        if finding.get("category") in ("security", "bug"):
-            finding_id = f"F{number:03}"
-            predictions.append({"id": finding_id, "type": finding_type(finding), "file": finding.get("file"),
-                                "line": finding.get("line"), "title": finding.get("title"),
-                                "verification": statuses.get(finding_id, "not verified")})
-    before = match(predictions, labels)
-    after = match([p for p in predictions if p["verification"] == "supported"], labels)
-    counts = {status: list(statuses.values()).count(status) for status in ("supported", "uncertain", "unsupported")}
-    verification = trace.get("verification", {})
-    return {"case": case_id, "status": "scored", "before": before, "after": after,
-            "verification_counts": counts,
-            # Correct before verification, but not kept after it.
-            "correct_rejected": sorted(set(before["matched"]) - set(after["matched"])),
-            "verification_tokens": verification.get("input_tokens", 0) + verification.get("output_tokens", 0)}
-
-
-def summarize(case_results):
-    scored = [r for r in case_results if r["status"] == "scored"]
-    totals = {}
-    for stage in ("before", "after"):
-        totals[stage] = metrics(*(sum(r[stage][key] for r in scored) for key in ("tp", "fp", "fn")))
-    return {"cases_scored": len(scored), "failed": [r["case"] for r in case_results if r["status"] == "failed"],
-            "totals": totals,
-            "correct_rejected": sum(len(r["correct_rejected"]) for r in scored),
-            "verification_counts": {s: sum(r["verification_counts"][s] for r in scored)
-                                    for s in ("supported", "uncertain", "unsupported")},
-            "verification_tokens": sum(r["verification_tokens"] for r in scored),
-            "cases": case_results}
-
-
-def git(repository, *arguments):
-    command = ["git", "-C", str(repository), "-c", "user.name=Eval", "-c", "user.email=eval@example.invalid"]
-    subprocess.run([*command, *arguments], capture_output=True, check=True)
-
-
-def copy_files(source, destination):
-    for file in source.glob("*.py"):
-        (destination / file.name).write_text(file.read_text())
-
-
-def run_case(case_id, raw_directory):
-    """Run the real reviewer CLI on one case; save its trace and printed output."""
-    case = HERE / "cases" / case_id
-    trace = raw_directory / f"{case_id}.json"
-    trace.unlink(missing_ok=True)
-    with tempfile.TemporaryDirectory(prefix="codeguardian-eval-") as temporary:
-        if (case / "before").is_dir():
-            # Diff case: commit before/, then commit after/, and review the last commit.
-            target = Path(temporary)
-            git(target, "init", "-q")
-            copy_files(case / "before", target)
-            git(target, "add", "-A")
-            git(target, "commit", "-qm", "before")
-            copy_files(case / "after", target)
-            git(target, "add", "-A")
-            git(target, "commit", "-qm", "after")
-            options = ["--mode", "diff"]
+    uses_llm = any(m in mode_runner.LLM_MODES for m in modes)
+    if not uses_llm:
+        return modes, case_ids, repeats, ["none"]
+    try:
+        if args.models:
+            model_keys = args.models.split(",")
         else:
-            target, options = case, ["--agent"]
-        process = subprocess.run([sys.executable, str(REVIEWER), str(target), *options, "--verify",
-                                  "--trace-file", str(trace)], capture_output=True, text=True, timeout=600)
-    (raw_directory / f"{case_id}.log").write_text(process.stdout + process.stderr)
+            provider, model, _ = get_settings()
+            model_keys = [f"{provider}:{model}"]
+        for key in model_keys:
+            get_settings(*key.split(":", 1))   # checks that the key and model are configured
+    except ValueError as error:
+        parser.error(str(error))
+    if args.budget is not None:
+        test_usage = {"llm_calls": 1, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+        missing = [key for key in model_keys if review_cost(test_usage, prices.get(key))[0] is None]
+        if missing:
+            parser.error(f"--budget needs prices in evaluation/pricing.json for: {', '.join(missing)}")
+    return modes, case_ids, repeats, model_keys
 
 
-def percent(value):
-    return "n/a" if value is None else f"{value:.0%}"
+def make_run_info(args, modes, case_ids, repeats, model_keys, pricing):
+    """Everything needed to reproduce this run later."""
+    return {"date": datetime.now().isoformat(timespec="seconds"), "commit": git_commit(),
+            "dataset_version": dataset_version(), "models": model_keys, "modes": modes,
+            "cases": case_ids, "repeats": repeats, "budget": args.budget, "smoke": args.smoke,
+            "pricing": {key: pricing[key] for key in ("currency", "unit", "pricing_date")},
+            "settings": {"temperature": "provider default (not set by CodeGuardian)",
+                         "openai_reasoning_effort": os.getenv("OPENAI_REASONING_EFFORT") or "model default",
+                         "agent_max_steps_single_file": agent.MAX_STEPS,
+                         "agent_max_steps_project": project.MAX_PROJECT_STEPS,
+                         "max_verified_findings": verifier.MAX_VERIFIED_FINDINGS,
+                         "line_tolerance": LINE_TOLERANCE, "python": sys.version.split()[0]}}
 
 
-def write_summary(summary, path):
-    lines = ["# CodeGuardian evaluation", "",
-             f"Cases scored: {summary['cases_scored']}. Failed: {', '.join(summary['failed']) or 'none'}.", "",
-             "| Stage | TP | FP | FN | Precision | Recall | F1 |", "| --- | --- | --- | --- | --- | --- | --- |"]
-    for stage, label in (("before", "Before verification"), ("after", "After verification (supported only)")):
-        t = summary["totals"][stage]
-        lines.append(f"| {label} | {t['tp']} | {t['fp']} | {t['fn']} | "
-                     f"{percent(t['precision'])} | {percent(t['recall'])} | {percent(t['f1'])} |")
-    counts = summary["verification_counts"]
-    lines += ["", f"Verification: {counts['supported']} supported, {counts['uncertain']} uncertain, "
-              f"{counts['unsupported']} unsupported. Correct findings rejected by verification: "
-              f"{summary['correct_rejected']}. Verification tokens: {summary['verification_tokens']}.",
-              "", "## Per case", "", "| Case | Before TP/FP/FN | After TP/FP/FN |", "| --- | --- | --- |"]
-    for r in summary["cases"]:
-        if r["status"] == "failed":
-            lines.append(f"| {r['case']} | failed: {r['error']} | failed |")
-        else:
-            b, a = r["before"], r["after"]
-            lines.append(f"| {r['case']} | {b['tp']}/{b['fp']}/{b['fn']} | {a['tp']}/{a['fp']}/{a['fn']} |")
-    lines += ["", "## To investigate (before verification)", ""]
-    for r in summary["cases"]:
-        if r["status"] != "scored":
-            continue
-        for p in r["before"]["false_positives"]:
-            lines.append(f"- False positive in {r['case']}: {p['file']}:{p['line']} {p['type']} - "
-                         f"{p['title']} (verification: {p['verification']})")
-        for label in r["before"]["missed"]:
-            lines.append(f"- Missed in {r['case']}: {label['file']}:{label['line']} {label['type']}")
-    path.write_text("\n".join(lines) + "\n")
+def settings_for(model_key):
+    return (None, None, None) if model_key == "none" else get_settings(*model_key.split(":", 1))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate CodeGuardian on the labeled benchmark.")
-    parser.add_argument("--cases", help="Comma-separated case names (default: all)")
-    parser.add_argument("--score-only", action="store_true", help="Rescore saved results without API calls")
-    parser.add_argument("--results", type=Path, default=HERE / "results", help="Output folder")
-    args = parser.parse_args()
-
+    parser, args = parse_arguments()
     labels = json.loads((HERE / "labels.json").read_text())["cases"]
-    case_ids = args.cases.split(",") if args.cases else list(labels)
-    unknown = [case_id for case_id in case_ids if case_id not in labels]
-    if unknown:
-        parser.error(f"Unknown case(s): {', '.join(unknown)}")
-    raw_directory = args.results / "raw"
-    raw_directory.mkdir(parents=True, exist_ok=True)
+    pricing, prices = load_pricing(HERE / "pricing.json")
 
-    case_results = []
-    for case_id in case_ids:
-        if not args.score_only:
-            print(f"Reviewing {case_id} ...", flush=True)
-            run_case(case_id, raw_directory)
-        trace_file = raw_directory / f"{case_id}.json"
-        trace = json.loads(trace_file.read_text()) if trace_file.exists() else None
-        case_results.append(score_case(case_id, trace, labels[case_id]))
+    if args.score_only:
+        run_directory = saved_run(parser, args.results, args.score_only)
+        run_info = json.loads((run_directory / "run_info.json").read_text())
+        run_info["pricing"] = {key: pricing[key] for key in ("currency", "unit", "pricing_date")}
+    else:
+        load_dotenv(HERE.parent / ".env")
+        modes, case_ids, repeats, model_keys = choose_plan(parser, args, labels, prices)
+        run_directory = args.results / datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_directory.mkdir(parents=True)
+        run_info = make_run_info(args, modes, case_ids, repeats, model_keys, pricing)
+        (run_directory / "run_info.json").write_text(json.dumps(run_info, indent=2))
+        run_benchmark(case_ids, modes, model_keys, repeats, run_directory, Budget(args.budget), args.pause,
+                      settings_for, prices)
 
-    summary = summarize(case_results)
-    (args.results / "results.json").write_text(json.dumps(summary, indent=2))
-    write_summary(summary, args.results / "summary.md")
-    print((args.results / "summary.md").read_text())
+    summaries = aggregate(load_rows(run_directory, labels), prices)
+    (run_directory / "results.json").write_text(json.dumps({"run": run_info, "summaries": summaries}, indent=2))
+    write_report(summaries, run_info, run_directory / "summary.md")
+    print((run_directory / "summary.md").read_text())
+    print(f"Saved in {run_directory}")
 
 
 if __name__ == "__main__":

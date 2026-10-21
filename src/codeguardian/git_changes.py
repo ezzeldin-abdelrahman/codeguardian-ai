@@ -4,10 +4,7 @@ import json
 import re
 import subprocess
 
-if __package__:
-    from . import project as project_access
-else:
-    import project as project_access
+from . import project as project_access
 
 MAX_CHANGED_FILES = 20
 MAX_CHANGE_CHARS = 12_000
@@ -71,10 +68,8 @@ def eligible(path):
         return False
 
 
-def collect_changes(directory, base='HEAD~1'):
-    """Return project access state and JSON-ready changes from base to current files."""
-    project = project_access.create_project(directory)
-    root = project['root']
+def resolve_base(root, base):
+    """Check the repository and return the base commit's full hash."""
     if not (root / '.git').exists():
         raise ValueError('Diff mode requires a Git repository root directory.')
     try:
@@ -86,25 +81,53 @@ def collect_changes(directory, base='HEAD~1'):
                          'two commits; use --base HEAD to review only uncommitted changes.') from None
     if run_git(root, ['diff', '--name-only', '--diff-filter=U']).strip():
         raise ValueError('Resolve Git merge conflicts before starting a diff review.')
+    return commit
 
+
+def changed_files(root, commit):
+    """List (status letter, old path, new path) for every changed Python file.
+
+    Added files have no old path; deleted files have no new path; renames have both.
+    """
     # -z separates fields with NUL bytes so unusual filenames are parsed safely.
     fields = run_git(root, ['diff', *DIFF_OPTIONS, '--name-status', '-z', commit, '--', '*.py']).split('\0')[:-1]
-    context = {'base': commit, 'comparison': 'base commit to current files (committed, staged, and unstaged)',
-               'changes': [], 'changed_count': 0, 'omitted_files': 0,
-               'skipped': [], 'skipped_count': 0, 'excluded_count': 0,
-               'limitations': list(dict.fromkeys(project['limits_reached']))[:5]}
+    files = []
     index = 0
     while index < len(fields):
         status = fields[index][0]
         old_path = new_path = fields[index + 1]
         index += 2
-        if status == 'R':
+        if status == 'R':  # a rename has a second path
             new_path = fields[index]
             index += 1
-        if status == 'A':
-            old_path = None
-        if status == 'D':
-            new_path = None
+        files.append((status, None if status == 'A' else old_path, None if status == 'D' else new_path))
+    return files
+
+
+def fit_to_size_limit(context):
+    """Drop whole hunks first, then whole file records, until the context fits MAX_CHANGE_CHARS."""
+    def too_big():
+        return len(json.dumps(context)) > MAX_CHANGE_CHARS - 200
+    for change in reversed(context['changes']):
+        while change['hunks'] and too_big():
+            change['hunks'].pop()
+            change['omitted_hunks'] += 1
+    while context['changes'] and too_big():
+        context['changes'].pop()
+    while context['skipped'] and too_big():
+        context['skipped'].pop()
+
+
+def collect_changes(directory, base='HEAD~1'):
+    """Return project access state and JSON-ready changes from base to current files."""
+    project = project_access.create_project(directory)
+    root = project['root']
+    commit = resolve_base(root, base)
+    context = {'base': commit, 'comparison': 'base commit to current files (committed, staged, and unstaged)',
+               'changes': [], 'changed_count': 0, 'omitted_files': 0,
+               'skipped': [], 'skipped_count': 0, 'excluded_count': 0,
+               'limitations': list(dict.fromkeys(project['limits_reached']))[:5]}
+    for status, old_path, new_path in changed_files(root, commit):
         if status not in STATUS_NAMES or not all(eligible(path) for path in (old_path, new_path) if path):
             context['excluded_count'] += 1
             continue
@@ -122,15 +145,7 @@ def collect_changes(directory, base='HEAD~1'):
 
     context['skipped_count'] = len(context['skipped'])
     context['skipped'] = context['skipped'][:MAX_CHANGED_FILES]
-    # Bound the exact serialized context, dropping whole hunks before file records.
-    for change in reversed(context['changes']):
-        while change['hunks'] and len(json.dumps(context)) > MAX_CHANGE_CHARS - 200:
-            change['hunks'].pop()
-            change['omitted_hunks'] += 1
-    while context['changes'] and len(json.dumps(context)) > MAX_CHANGE_CHARS - 200:
-        context['changes'].pop()
-    while context['skipped'] and len(json.dumps(context)) > MAX_CHANGE_CHARS - 200:
-        context['skipped'].pop()
+    fit_to_size_limit(context)
     context['omitted_files'] = context['changed_count'] - len(context['changes'])
     if context['skipped_count'] or context['omitted_files'] or any(c['omitted_hunks'] for c in context['changes']):
         context['limitations'].append('Change coverage is partial; skipped/omitted code was not reviewed.')

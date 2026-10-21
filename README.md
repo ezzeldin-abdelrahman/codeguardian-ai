@@ -44,6 +44,31 @@ tool-calling API. The simpler one-shot review (no `--agent`) also supports Gemin
 OpenRouter, and Claude; it sends the whole file in a single request, then runs Bandit
 and Ruff separately.
 
+## Project layout
+
+Every file has one job and is at most about 230 lines.
+
+```
+src/codeguardian/
+  reviewer.py      command line: reads options and prints results
+  agent.py         the agent loop: ask the model, run the tool it chose, repeat
+  agent_tools.py   the tools the model may ask for, and the checks on each request
+  prompts.py       the instructions the agent receives
+  tools.py         Bandit, Ruff, reading files, and searching code
+  project.py       which project files may be read, and the size limits
+  git_changes.py   collects the Git changes for diff mode
+  verifier.py      v0.7 evidence verification
+  findings.py      checks and prints findings
+  providers/       everything that talks to an LLM
+    settings.py      provider, model, and API key from .env
+    review.py        the one-shot review (one request, no tools)
+    agent_calls.py   one agent turn (OpenAI or Groq) and one verification request
+    usage.py         token counts and short error messages
+evaluation/        v0.8-v0.9 benchmark (evaluate.py, modes.py, scoring.py, report.py)
+examples/          end-to-end demo script and a saved sample run
+tests/             unit tests; no paid API calls
+```
+
 ## Setup
 
 Use Python 3.10 or newer. From the repository root:
@@ -467,7 +492,7 @@ verification alone.
 
 **Matching rules.**
 - Only `security` and `bug` findings are scored (the benchmark does not label quality or testing issues).
-- A keyword list maps each finding's title and description to an issue type (`TYPE_KEYWORDS` in `evaluate.py`).
+- A keyword list maps each finding's title and description to an issue type (`TYPE_KEYWORDS` in `evaluation/scoring.py`).
 - A finding matches a label when the type and file are the same and the line is within **±3 lines**.
 - Matching is one-to-one: each label is matched by its closest finding, so duplicates count as false positives.
 - Unmatched findings are false positives (FP); unmatched labels are false negatives (FN).
@@ -483,3 +508,72 @@ positives and missed issues to investigate.
 
 Limitations: 12 cases are enough to show the method, not to make strong claims, and
 LLM results vary between runs.
+
+## v0.9: Quality, speed, and cost benchmark
+
+```bash
+python evaluation/evaluate.py --modes static_only            # free: Bandit + Ruff only
+python evaluation/evaluate.py --smoke                        # 2 cases, all modes: run this first
+python evaluation/evaluate.py --modes all \
+    --models openai:gpt-6-luna,groq:openai/gpt-oss-120b --repeats 2 --budget 1.00 --pause 20
+python evaluation/evaluate.py --score-only                   # rebuild the latest report, no API calls
+```
+
+The v0.8 benchmark now compares four review approaches, all built from existing code.
+The evaluation code is split into four short files:
+
+- `evaluate.py`: the command line, running the cases, and the budget
+- `modes.py`: runs one review mode on one case, using only existing CodeGuardian code
+- `scoring.py`: matches findings to labels and calculates metrics and cost
+- `report.py`: writes `summary.md`
+
+The four modes:
+
+| Mode | What it does | What it can see |
+| --- | --- | --- |
+| `static_only` | Bandit + Ruff, no LLM | fixed rules only |
+| `llm_only` | one `review_code()` call per case | one whole file, no tools |
+| `agentic` | the normal tool-using agent | can read, search, and run tools within a step limit |
+| `agentic_verified` | the same agent findings, then `--verify` | as above, plus evidence verification |
+
+`agentic` and `agentic_verified` share **one** agent run, so their difference comes from
+verification alone and the agent is paid for once. Every mode is scored with the same
+v0.8 matching rules and labels. Cases a mode cannot handle fairly are reported as
+**unsupported**, not as clean: `llm_only` skips the multi-file and Git-diff cases, and
+`static_only` skips the Git-diff case. Without `--modes`, the command runs `agentic` and
+`agentic_verified`, which is the v0.8 before/after comparison.
+
+**Measured per review:** time, LLM calls, tool calls, input/cached/output tokens (from
+OpenAI-compatible providers; Claude and Gemini usage is reported as unavailable),
+status, errors, and timeouts. CodeGuardian makes no automatic retries, so retries are 0.
+A missing value is shown as `n/a` or `unavailable`, never as 0.
+
+**Cost** uses `evaluation/pricing.json` (USD per 1,000,000 tokens, with a pricing date):
+(input - cached) x input price + cached x cached price + output x output price.
+A missing price makes the cost **unknown**. If cached tokens are not reported, all input
+is charged at the full price and the cost is marked **upper bound**. Agent and
+verification tokens are added once each. Costs are estimates, not bills; Groq's free
+tier is not billed at all.
+
+**Budget.** `--budget` is approximate: before each case it stops the LLM modes if
+"spent so far + average cost per case" would exceed the limit (5 cents is assumed before
+the first case). A single case can still go over, because its cost is only known after it
+runs. `static_only` keeps running because it is free. `--budget` needs prices for every model.
+
+**Reproducibility.** Each run is saved in `evaluation/results/<date-time>/` with
+`run_info.json` (git commit, dataset hash, models, modes, repeats, limits), one raw JSON
+file per review, `results.json`, and `summary.md`. The report compares modes and models
+side by side (quality, speed and cost, reliability, false positives by category, the
+effect of verification), lists missing or incomparable data, and ends with limitations
+and an empty Discussion section to write by hand. It does not pick a winner.
+
+**OpenAI API style.** The OpenAI agent uses the Responses API, because newer reasoning
+models such as `gpt-6-luna` only allow tools there. Groq still uses Chat Completions.
+The agent's own message format is unchanged; `providers` converts it for OpenAI. The
+optional `.env` setting `OPENAI_REASONING_EFFORT` (for example `none`) applies to every
+OpenAI call, so the modes stay comparable, and it is recorded in each benchmark run.
+API errors now include the provider's short message, with the API key removed.
+
+**Free-tier note.** Groq's free tier has request and token rate limits. Agent requests
+can be large, so some reviews may fail with an API error; they are reported as failed.
+`--pause` adds a wait between cases to reduce this.
