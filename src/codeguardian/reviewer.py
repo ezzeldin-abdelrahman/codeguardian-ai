@@ -3,6 +3,8 @@
     python src/codeguardian/reviewer.py app.py                   # one-shot AI review + Bandit + Ruff
     python src/codeguardian/reviewer.py app.py --agent           # tool-using agent
     python src/codeguardian/reviewer.py . --mode diff --verify   # review the last commit, then verify
+    python src/codeguardian/reviewer.py . --mode diff --merge-base main --report-md review.md
+                                                                 # review a branch like a pull request
 """
 
 import argparse
@@ -15,8 +17,10 @@ from dotenv import load_dotenv
 # When this file is run directly, make the codeguardian package importable.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from codeguardian.agent import run_agent  # noqa: E402
+from codeguardian.changed_lines import mark_changed_lines, static_review  # noqa: E402
 from codeguardian.findings import parse_findings, print_findings  # noqa: E402
 from codeguardian.git_changes import collect_changes  # noqa: E402
+from codeguardian.markdown_report import write_markdown  # noqa: E402
 from codeguardian.project import create_project  # noqa: E402
 from codeguardian.providers import get_settings, review_code  # noqa: E402
 from codeguardian.tools import run_bandit, run_ruff  # noqa: E402
@@ -34,13 +38,23 @@ def parse_arguments():
     parser.add_argument("--trace-file", type=Path, help="Save agent actions and observations as JSON")
     parser.add_argument("--verify", action="store_true",
                         help="Check each agent finding against source evidence (extra API calls)")
+    parser.add_argument("--merge-base", metavar="BRANCH",
+                        help="Diff mode: compare with where this branch split off from BRANCH (like a pull request)")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="Diff mode: only Bandit and Ruff on changed lines; no API calls")
+    parser.add_argument("--report-md", type=Path, help="Also write a Markdown report to this file")
+    parser.add_argument("--title", default="local review", help="Title for the Markdown report")
     args = parser.parse_args()
-    if args.base is not None and args.mode != "diff":
-        parser.error("--base requires --mode diff")
+    if (args.base is not None or args.merge_base or args.no_llm) and args.mode != "diff":
+        parser.error("--base, --merge-base, and --no-llm require --mode diff")
+    if args.base is not None and args.merge_base:
+        parser.error("Use either --base or --merge-base, not both")
+    if args.no_llm and args.verify:
+        parser.error("--verify needs the LLM, so it cannot be combined with --no-llm")
     if args.mode == "diff":
         args.agent = True
-    if args.trace_file and not args.agent:
-        parser.error("--trace-file requires --agent")
+    if (args.trace_file or args.report_md) and not args.agent:
+        parser.error("--trace-file and --report-md require --agent or --mode diff")
     if args.verify and not args.agent:
         parser.error("--verify requires --agent or --mode diff")
     path = Path(args.filename)
@@ -72,7 +86,12 @@ def run_agent_review(args, path):
     """Collect Git changes if needed, run the agent, and optionally verify its findings."""
     project, changes = None, None
     if args.mode == "diff":
-        project, changes = collect_changes(path, "HEAD~1" if args.base is None else args.base)
+        project, changes = collect_changes(path, "HEAD~1" if args.base is None else args.base,
+                                           merge_base_with=args.merge_base)
+        if args.no_llm and changes["changed_count"]:
+            findings, errors = static_review(project, changes)
+            return {"status": "complete", "findings": findings, "trace": [], "changes": changes,
+                    "error": None, "notes": errors}
         if not changes["changed_count"]:
             # Nothing to review, so no LLM request is made.
             partial = bool(changes["skipped_count"] or changes["limitations"])
@@ -89,6 +108,8 @@ def run_agent_review(args, path):
     if args.verify and report["status"] == "complete" and report["findings"]:
         report["verification"] = verify_findings(report["findings"], path, model, api_key, provider=provider,
                                                  project=project, change_context=changes)
+    if changes is not None:
+        mark_changed_lines(report["findings"], changes)
     return report
 
 
@@ -192,6 +213,10 @@ def main():
     print_agent_report(report, args.mode)
     if args.trace_file:
         save_trace(parser, args.trace_file, report)
+    if args.report_md:
+        review_type = ("Bandit and Ruff only, on changed lines (no LLM)" if args.no_llm else
+                       "AI agent" + (" with evidence verification" if args.verify else ""))
+        write_markdown(report, args.title, args.report_md, review_type)
     if report["status"] != "complete":
         parser.exit(status=1)
 

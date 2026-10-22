@@ -201,7 +201,12 @@ def summarize_group(mode, model, group, prices):
     attempted = [row for row in group if row["score"]["status"] in ("scored", "failed")]
     quality = metrics(**total_counts([row["score"] for row in scored]))
     cost, cost_kind = combine_cost([review_cost(row["result"]["usage"], prices.get(model)) for row in attempted])
+    completed_cost, completed_cost_kind = combine_cost(
+        [review_cost(row["result"]["usage"], prices.get(model)) for row in scored])
     errors = [row["result"]["error"] for row in group if row["score"]["status"] == "failed"]
+    # Second view: leave out false positives whose issue type is outside the benchmark ("other").
+    other = sum(p["type"] == "other" for row in scored for p in row["score"]["false_positives"])
+    without_other = metrics(quality["tp"], quality["fp"] - other, quality["fn"])
     return {
         "mode": mode, "model": model, **quality,
         "f1_by_repeat": f1_for_each_repeat(scored),
@@ -213,6 +218,9 @@ def summarize_group(mode, model, group, prices):
         "retries": 0,  # CodeGuardian makes no automatic retries.
         "latency": latency([row["result"]["seconds"] for row in scored if row["result"]["seconds"] is not None]),
         "usage": total_usage(attempted), "cost": cost, "cost_kind": cost_kind,
+        "second_view": {"other_false_positives": other, "precision_without_other": without_other["precision"],
+                        "f1_without_other": without_other["f1"], "completed_reviews_cost": completed_cost,
+                        "completed_reviews_cost_kind": completed_cost_kind},
         "cost_per_completed_review": cost / len(scored) if cost is not None and scored else None,
         "cost_per_true_positive": cost / quality["tp"] if cost is not None and quality["tp"] else None,
         "correct_rejected": sum(len(row["score"]["correct_rejected"]) for row in scored),

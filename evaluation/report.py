@@ -72,6 +72,22 @@ def cost_table(summaries):
     return lines
 
 
+def second_view_table(summaries):
+    """Two extra views, clearly separate from the main scores above, which are not changed."""
+    lines = ["## Second view (not the main score)", "",
+             "\"Other\" means a security or bug finding outside the six benchmark issue types (for example "
+             "\"missing TLS\"). The main score counts these as false positives. Completed-review cost leaves out "
+             "failed reviews, whose token counts are unknown.", "",
+             "| Mode | Model | \"Other\" FPs | Precision without \"other\" | F1 without \"other\" | "
+             "Cost of completed reviews |", "| --- | --- | --- | --- | --- | --- |"]
+    for s in summaries:
+        view = s["second_view"]
+        lines.append(f"| {s['mode']} | {s['model']} | {view['other_false_positives']} | "
+                     f"{percent(view['precision_without_other'])} | {percent(view['f1_without_other'])} | "
+                     f"{money(view['completed_reviews_cost'], view['completed_reviews_cost_kind'])} |")
+    return lines
+
+
 def false_positive_line(summaries):
     parts = []
     for s in summaries:
@@ -108,7 +124,8 @@ def missing_section(summaries):
 
 
 def write_report(summaries, run_info, path):
-    sections = [header(run_info), quality_table(summaries), cost_table(summaries), false_positive_line(summaries),
+    sections = [header(run_info), quality_table(summaries), cost_table(summaries), second_view_table(summaries),
+                false_positive_line(summaries),
                 verification_section(summaries, run_info["models"]), missing_section(summaries),
                 ["## Limitations", ""] + LIMITATIONS,
                 ["## Discussion", "", "_To be written by hand after reading the results above._"]]

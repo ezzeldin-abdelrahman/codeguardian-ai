@@ -84,6 +84,17 @@ def resolve_base(root, base):
     return commit
 
 
+def merge_base(root, ref):
+    """The commit where the current branch split off from ref (what a pull request is compared with)."""
+    try:
+        return run_git(root, ['merge-base', '--end-of-options', ref, 'HEAD']).strip()
+    except RuntimeError as error:
+        if 'failed' not in str(error):  # For example, Git is not installed.
+            raise
+        raise ValueError(f'Cannot find where HEAD split off from {ref!r}. Check the branch name '
+                         'and make sure the full Git history is available.') from None
+
+
 def changed_files(root, commit):
     """List (status letter, old path, new path) for every changed Python file.
 
@@ -118,12 +129,21 @@ def fit_to_size_limit(context):
         context['skipped'].pop()
 
 
-def collect_changes(directory, base='HEAD~1'):
-    """Return project access state and JSON-ready changes from base to current files."""
+def collect_changes(directory, base='HEAD~1', *, merge_base_with=None):
+    """Return project access state and JSON-ready changes from base to current files.
+
+    With merge_base_with (for example main), the base is where the current branch split off
+    from that branch, so only the branch's own changes are reviewed, like a pull request.
+    """
     project = project_access.create_project(directory)
     root = project['root']
+    if merge_base_with is not None:
+        resolve_base(root, merge_base_with)   # checks the repository and the reference first
+        base = merge_base(root, merge_base_with)
     commit = resolve_base(root, base)
-    context = {'base': commit, 'comparison': 'base commit to current files (committed, staged, and unstaged)',
+    context = {'base': commit, 'head': run_git(root, ['rev-parse', 'HEAD']).strip(),
+               'merge_base_with': merge_base_with,
+               'comparison': 'base commit to current files (committed, staged, and unstaged)',
                'changes': [], 'changed_count': 0, 'omitted_files': 0,
                'skipped': [], 'skipped_count': 0, 'excluded_count': 0,
                'limitations': list(dict.fromkeys(project['limits_reached']))[:5]}

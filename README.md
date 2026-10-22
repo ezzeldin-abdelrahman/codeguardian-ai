@@ -1,10 +1,31 @@
 # CodeGuardian AI
 
-An AI code reviewer for Python. In its main mode, an LLM agent reviews the changes
-in your last Git commit by deciding for itself which tools to use: reading code,
-searching the project, and running the Bandit (security) and Ruff (code quality)
-analyzers. The reviewed code is never executed. API requests send source code to the
-selected provider and may cost money. All findings are AI-generated and unverified.
+CodeGuardian is an AI code reviewer for Python, built as a learning project to show how
+an **agentic AI application** works in practice. An LLM agent reviews code changes by
+deciding for itself which tools to use (reading code, searching the project, and running
+the Bandit security scanner and the Ruff linter). A second, separate step checks each
+finding against the actual source code, and a small labeled benchmark measures how well
+the whole system works. In v1.0 it reviews every GitHub pull request automatically.
+
+The reviewed code is never executed. API requests send source code to the selected
+provider and may cost money. All findings are AI-generated suggestions, not proof.
+
+**Contents:** [What it does](#what-it-does) · [How the agent works](#how-the-agent-works) ·
+[Setup](#setup) · [Running it](#running-it) · [Pull request reviews](#pull-request-reviews-github-actions) ·
+[Evaluation and results](#evaluation-and-benchmark-results) · [Security and limitations](#security-and-limitations) ·
+[Demo](#demo) · [Project layout](#project-layout) · [Version history](docs/version-history.md)
+
+## What it does
+
+| Feature | Version | Command |
+| --- | --- | --- |
+| One-shot review: one LLM call, then Bandit and Ruff | v0.1-v0.3 | `reviewer.py app.py` |
+| Tool-using agent on one file or a small project | v0.4-v0.5 | `reviewer.py app.py --agent` |
+| Review only the changes of the last commit | v0.6 | `reviewer.py . --mode diff` |
+| Evidence verification of every finding | v0.7 | add `--verify` |
+| Accuracy evaluation on 12 hand-labeled cases | v0.8 | `evaluation/evaluate.py` |
+| Quality, speed, and cost benchmark of four approaches | v0.9 | `evaluation/evaluate.py --modes all` |
+| Pull request review in GitHub Actions, Markdown report | v1.0 | automatic, or `--merge-base main` |
 
 ## How the agent works
 
@@ -18,7 +39,7 @@ bounded loop:
   (or a file)     next step            │                 request, runs the tool,
                                        no                and returns the result
                                        ▼
-                             final JSON findings ──► validated and printed
+                             final JSON findings ──► validated, optionally verified, reported
 ```
 
 1. **Start:** the agent receives the task, for example the patches from `git diff`.
@@ -26,8 +47,12 @@ bounded loop:
 3. **Act:** CodeGuardian checks the request (known tool, valid arguments, allowed file)
    before running it. Errors are sent back to the model as results, not hidden.
 4. **Observe:** the tool output goes back into the conversation, and the loop repeats.
-5. **Finish:** the model returns findings as JSON. CodeGuardian checks every field, and
-   in project/diff mode rejects findings that cite files or lines the agent never saw.
+5. **Finish:** the model returns findings as JSON. CodeGuardian checks every field and
+   removes any finding that cites a file or line the agent never actually saw.
+6. **Verify (optional):** for each finding, code collects the cited lines and nearby
+   Bandit/Ruff results, one separate LLM call judges the claim, and fixed rules decide
+   `supported`, `uncertain`, or `unsupported`. Only Bandit/Ruff agreement counts as
+   independent confirmation; two LLM calls agreeing is not proof.
 
 | Mode | Tools the agent can call |
 | --- | --- |
@@ -35,39 +60,13 @@ bounded loop:
 | Project or Git diff (`--mode diff`) | `list_files`, `inspect_file`, `search_code`, `run_bandit`, `run_ruff` |
 
 **Safety limits:** at most 5 steps for one file or 10 for a project, one tool call per
-turn, at most 10 files inspected, and a fixed conversation size. When a limit is
-reached, tools are switched off and the model must give its final answer. Tool output
-and source code are treated as data, never as instructions to the agent.
+turn, at most 10 files inspected, a fixed conversation size, and at most 10 verified
+findings. When a limit is reached, tools are switched off and the model must answer.
+Source code and tool output are treated as data, never as instructions.
 
-**Providers:** the agent uses OpenAI (the default) or Groq, because it relies on their
-tool-calling API. The simpler one-shot review (no `--agent`) also supports Gemini,
-OpenRouter, and Claude; it sends the whole file in a single request, then runs Bandit
-and Ruff separately.
-
-## Project layout
-
-Every file has one job and is at most about 230 lines.
-
-```
-src/codeguardian/
-  reviewer.py      command line: reads options and prints results
-  agent.py         the agent loop: ask the model, run the tool it chose, repeat
-  agent_tools.py   the tools the model may ask for, and the checks on each request
-  prompts.py       the instructions the agent receives
-  tools.py         Bandit, Ruff, reading files, and searching code
-  project.py       which project files may be read, and the size limits
-  git_changes.py   collects the Git changes for diff mode
-  verifier.py      v0.7 evidence verification
-  findings.py      checks and prints findings
-  providers/       everything that talks to an LLM
-    settings.py      provider, model, and API key from .env
-    review.py        the one-shot review (one request, no tools)
-    agent_calls.py   one agent turn (OpenAI or Groq) and one verification request
-    usage.py         token counts and short error messages
-evaluation/        v0.8-v0.9 benchmark (evaluate.py, modes.py, scoring.py, report.py)
-examples/          end-to-end demo script and a saved sample run
-tests/             unit tests; no paid API calls
-```
+**Providers:** the agent and verification use **OpenAI** (default, Responses API) or
+**Groq** (Chat Completions). The one-shot review also supports **Gemini**,
+**OpenRouter** (free models only), and **Claude**.
 
 ## Setup
 
@@ -77,503 +76,212 @@ Use Python 3.10 or newer. From the repository root:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+cp .env.example .env        # then fill in the API key of the provider you use
 ```
 
-If you do not already have `.env`, copy `.env.example` to `.env` and fill in the
-selected provider's API key. Keep keys out of Git; `.env` is already ignored.
-The example uses OpenAI as the default provider.
-Model availability depends on the provider and your account.
+`.env` is ignored by Git. Main settings:
 
-## Run
+- `AI_PROVIDER`: `openai` (default), `groq`, `gemini`, `openrouter`, or `claude`.
+- `<PROVIDER>_MODEL` and `<PROVIDER>_API_KEY`, for example `OPENAI_MODEL=gpt-6-luna`.
+- Optional: `<PROVIDER>_MODELS` (allowed model list), `SUPPORTED_PROVIDERS`, and
+  `OPENAI_REASONING_EFFORT` (for example `none`; unset keeps the model's default).
+
+Command-line options `--provider` and `--model` override `.env` for one run.
+More configuration details are in the [version history](docs/version-history.md).
+
+## Running it
 
 ```bash
-python src/codeguardian/reviewer.py path/to/nonempty_file.py
-python src/codeguardian/reviewer.py path/to/nonempty_file.py --provider openai
-python src/codeguardian/reviewer.py path/to/nonempty_file.py --provider gemini --model YOUR_MODEL_ID
+# One-shot review of a file (AI review, then Bandit and Ruff)
+python src/codeguardian/reviewer.py samples/vulnerable_app.py
+
+# Tool-using agent on a file or a project folder, with evidence verification
+python src/codeguardian/reviewer.py samples/vulnerable_app.py --agent --verify
+
+# Review the last commit (plus uncommitted edits); --base HEAD reviews only uncommitted work
+python src/codeguardian/reviewer.py . --mode diff --verify
+
+# Review a branch like a pull request: compare with where it split off from main
+python src/codeguardian/reviewer.py . --mode diff --merge-base main --verify \
+    --report-md review.md --trace-file review.json --title "my-branch"
+
+# The same comparison with Bandit and Ruff only, on changed lines (free, no API key)
+python src/codeguardian/reviewer.py . --mode diff --merge-base main --no-llm --report-md review.md
 ```
 
-Use `samples/vulnerable_app.py` for a sample review.
+**Git-aware review** compares a base commit with the files on disk, so line numbers
+always refer to the current version. Added, modified, renamed, and deleted Python files
+are handled; other file types are ignored. New files must be added with `git add`.
+`--merge-base BRANCH` uses `git merge-base` to find where the current branch split off,
+so changes made to `BRANCH` since then are not counted as the branch's changes.
 
-## Configuration
+Findings are marked **in changed code** or **related code (not new in this change)**:
+the agent may report an issue in an unchanged file it inspected, but it is never shown
+as newly introduced. The Markdown report (`--report-md`) shows the commit range, status,
+counts by severity, each finding with file, line, evidence, and verification status,
+and any skipped files, limits, or errors. `--trace-file` saves the full JSON report.
 
-- `AI_PROVIDER`: default provider (defaults to `openai`; also supports `gemini`, `groq`, `openrouter`, and `claude`).
-- `SUPPORTED_PROVIDERS`: comma-separated enabled providers; defaults to all five.
-- `GEMINI_MODEL` / `OPENAI_MODEL`: each provider's default model.
-- `GEMINI_MODELS` / `OPENAI_MODELS`: optional comma-separated lists of allowed model IDs.
-  If set, the selected model (including the default) must be in its provider's list.
-  If omitted, the provider checks whether the requested model exists and is accessible.
-- `GEMINI_API_KEY` / `OPENAI_API_KEY`: only the selected provider's key is required.
+## Pull request reviews (GitHub Actions)
 
-CLI options override configuration for that run only. Existing shell environment variables
-take precedence over `.env`. The application loads `.env` from the repository root,
-while relative source paths are resolved from your current working directory.
+The workflow [.github/workflows/codeguardian.yml](.github/workflows/codeguardian.yml)
+reviews every pull request that changes Python files (`opened`, `synchronize`,
+`reopened`; draft PRs are skipped).
 
-A provider is the service you contact; a model is the specific AI selected within it.
-`get_settings()` selects and validates configuration. `review_code()` uses a simple
-`if`/`elif` to call the appropriate SDK. Adding a name to configuration alone does
-not implement a new provider. No provider classes or agent frameworks are used.
+**Setup (once):** in the GitHub repository, open *Settings → Secrets and variables →
+Actions*.
 
-## Groq and OpenRouter
+- **Secret** `OPENAI_API_KEY` (or `GROQ_API_KEY` if you use Groq).
+- **Variables** (optional): `AI_PROVIDER` (default `openai`), `OPENAI_MODEL`
+  (default `gpt-6-luna`), `GROQ_MODEL`, and `CODEGUARDIAN_VERIFY` (default `true`;
+  set to `false` to skip verification).
 
-Create keys in [Groq Console](https://console.groq.com/keys) and
-[OpenRouter](https://openrouter.ai/settings/keys), then fill in the corresponding
-placeholders in your local `.env`:
+**What happens:** the job checks out the PR's head commit with full history, installs
+the requirements, and runs [.github/scripts/pr_review.py](.github/scripts/pr_review.py).
+That script is the only GitHub-specific code: it reads the PR number and base commit,
+decides whether a paid review is allowed, and runs the normal CLI with
+`--mode diff --merge-base <PR base commit> --verify --report-md --trace-file`. The
+report appears on the run's **Summary** page, and `report.md` and `report.json` are
+uploaded as the `codeguardian-report` artifact. No comments are posted on the PR.
 
-```dotenv
-GROQ_API_KEY=your_groq_key
-GROQ_MODEL=openai/gpt-oss-120b
-OPENROUTER_API_KEY=your_openrouter_key
-OPENROUTER_MODEL=openrouter/free
-```
-
-If `SUPPORTED_PROVIDERS` is set, include `groq,openrouter` in it.
-Keep `AI_PROVIDER` unchanged to retain your current default.
-Optional `GROQ_MODELS` and `OPENROUTER_MODELS` accept comma-separated allowlists,
-just like the existing providers.
-
-```bash
-python src/codeguardian/reviewer.py samples/vulnerable_app.py --provider groq
-python src/codeguardian/reviewer.py samples/vulnerable_app.py --provider openrouter
-python src/codeguardian/reviewer.py samples/vulnerable_app.py --provider groq --model openai/gpt-oss-20b
-```
-
-Both integrations reuse the OpenAI Python SDK with their own server address and key;
-they do not use your OpenAI account balance. Groq uses your Groq account's plan and
-limits: remain on its free plan for free usage.
-OpenRouter is restricted to `openrouter/free` or IDs ending in `:free`.
-The free router can choose a different model each time. For repeatable comparisons,
-choose a specific available `:free` model using `--model`. Appending `:free` works
-only if that model has a free variant. No paid fallback is configured.
-
-Requests use Chat Completions: a system message holds review instructions, and a user
-message holds source text. The returned message content is the review. Existing OpenAI
-requests continue to use the Responses API. No extra dependencies are needed.
-
-References: [Groq compatibility](https://console.groq.com/docs/openai),
-[OpenRouter free variants](https://openrouter.ai/docs/guides/routing/model-variants/free),
-[free router](https://openrouter.ai/openrouter/free).
-
-Run offline tests with `python -m unittest discover -s tests -v`.
-
-## v0.2: Structured findings
-
-The model is prompted to return only `{"findings": [...]}`. Each finding contains
-`category` (bug/security/quality/testing), `severity` (low/medium/high/critical),
-nonempty `title`, `description`, and `recommendation` strings, and `line`
-(a positive integer or null). An empty findings list is valid.
-
-The application numbers source lines before sending them, parses the response with
-Python's built-in `json.loads()`, checks required fields and types, then prints a
-readable review. Invalid JSON or invalid fields produce a clear error and exit
-status 1. Markdown fences and surrounding prose are rejected, not repaired.
-
-This is prompt-based JSON output, not a provider-enforced schema. Providers may
-still return invalid responses. Validation checks structure, not whether a finding
-is true or its line reference is correct. All four providers and existing CLI
-options remain supported. No new dependencies are required.
-
-## Claude provider
-
-Install the dependencies, then set `CLAUDE_API_KEY` to your Anthropic API key and
-`CLAUDE_MODEL` to an available model (example: `claude-sonnet-4-5`) in `.env`.
-Include `claude` in `SUPPORTED_PROVIDERS` if that setting is present.
-An optional `CLAUDE_MODELS` comma-separated allowlist works like other providers.
-
-```bash
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python src/codeguardian/reviewer.py samples/vulnerable_app.py --provider claude
-```
-
-Claude uses the Anthropic Messages API with the same JSON review instructions.
-The application passes `CLAUDE_API_KEY` explicitly to the SDK. It extracts text
-blocks from the response and reports truncated output rather than parsing partial
-JSON. The output limit is 4096 tokens. Your default provider is unchanged.
-This integration requires Anthropic API access and any applicable API credits.
-Reference: https://platform.claude.com/docs/en/api/python/messages/create
-
-## v0.4: Tool-using agent (OpenAI or Groq)
-
-The original sequential review remains the default. Use `--agent` to let one model
-choose between `inspect_code`, `run_bandit`, and `run_ruff`:
-
-```bash
-.venv/bin/python src/codeguardian/reviewer.py samples/vulnerable_app.py --agent --provider groq --model openai/gpt-oss-120b
-.venv/bin/python src/codeguardian/reviewer.py samples/vulnerable_app.py --agent --trace-file review-trace.json
-```
-
-Agent mode follows `--provider`, then `AI_PROVIDER`, defaulting to OpenAI when unset.
-The supplied configuration uses `AI_PROVIDER=openai`. OpenAI uses `OPENAI_API_KEY`
-and `OPENAI_MODEL`; `--provider groq` uses `GROQ_API_KEY` and `GROQ_MODEL` instead.
-Existing provider/model allowlists apply. Other providers remain available for
-sequential review but are not supported by the agent.
-
-A tool request is a name and an empty argument object. Python binds all three
-tools to the user-selected file and executes only those named functions. The
-model receives the result as an observation before choosing its next action.
-No shell commands or alternate paths can be supplied by the model. Source code
-and observations are sent to the selected provider; the source is never executed.
-
-The loop allows five investigation turns and at most one finalization request.
-Invalid requests and failed tools consume turns. Multiple calls in one turn are
-rejected, and tools are disabled for finalization. Tool and API requests time out
-after 60 seconds; API retries are disabled. An API failure or invalid final JSON
-produces an incomplete review with exit status 1. Tool failures become observations
-and remain visible in the terminal even if the agent later finishes successfully.
-
-Final findings use the existing structure and source `llm`. Bandit/Ruff results
-retain their original source labels in observations. There is no automatic
-three-tool sequence, deduplication, or evidence verification.
-
-The optional trace file records status, final findings, tool names, arguments,
-call IDs, execution flags, and observations. It can include source text, so share
-it only when appropriate. No raw SDK responses, reasoning fields, or API keys
-are deliberately recorded. Groq requests set `include_reasoning=False`. Trace
-files are created only if the path does not already exist, to prevent overwrites.
-
-Implementation: `agent.py` controls the loop; `providers.request_agent_turn()`
-makes one request; `tools.py` executes tools; `findings.py` validates and displays
-findings. This is ordinary Python with no agent framework.
-
-Tests mock model responses, so they do not use API credits. Run them with:
-
-```bash
-.venv/bin/python -m unittest discover -s tests -v
-```
-
-## v0.5: Context-aware project investigation
-
-Pass a small Python project directory with `--agent`:
-
-```bash
-.venv/bin/python src/codeguardian/reviewer.py path/to/project --agent
-.venv/bin/python src/codeguardian/reviewer.py path/to/project --agent --trace-file project-review.json
-```
-
-Directory review uses the existing OpenAI/Groq agent and provider configuration. Single-file
-sequential review and single-file `--agent` behavior remain available. Directories
-without `--agent` produce a usage error. No new dependency or framework is required.
-
-The model can choose five tools in project mode:
-
-| Tool | Arguments | Observation |
+| Situation | Job | Summary shows |
 | --- | --- | --- |
-| `list_files` | `{}` | Eligible relative `.py` paths |
-| `inspect_file` | `path`, optional `start_line` and `end_line` | Original numbered lines; endpoints are inclusive |
-| `search_code` | `query` | Case-sensitive literal matches with file, line, and excerpt |
-| `run_bandit` | `path` | Normalized security findings |
-| `run_ruff` | `path` | Normalized quality findings |
+| Review completed (with or without findings) | passes | the findings report |
+| PR from a fork, or no API key set | passes with a warning | "**Paid AI review SKIPPED**" and the reason, plus free Bandit/Ruff results on changed lines |
+| API error, timeout, or incomplete review | fails | the error (API keys are removed from messages) |
 
-Python establishes the eligible-file list without reading source contents. The LLM
-chooses what to inspect; it is not given every file automatically. It can discover
-an import in one file, search for the imported symbol, and inspect its definition
-in another. Empty files can be inspected. Invalid ranges, unavailable tools, denied
-paths, or unreadable files become error observations instead of clean findings.
+Findings do not fail the job in v1.0; they are information for the people reviewing the PR.
+Cost: with `gpt-6-luna`, a small PR costs well under one cent, including verification.
 
-Project findings add `file` (relative path or null) to the existing finding structure.
-A cited file and line must have appeared in a successful content-bearing observation
-actually delivered to the model. A listing alone does not count as evidence. A
-project-wide finding must use both `file: null` and `line: null`. Final findings
-remain labeled `source: llm`; original tool sources remain in the trace. These
-location checks do not verify the truth of a finding or establish complete coverage.
+## Evaluation and benchmark results
 
-### Limits
+**Method (v0.8-v0.9).** `evaluation/cases/` contains 12 small, hand-written cases: one
+vulnerable and one safe example for SQL injection, command injection, hard-coded
+credentials, unsafe deserialization (`pickle`), path traversal, and weak password hashing
+(MD5). One case spans two files and one is a Git-diff case. The correct answers are in
+`evaluation/labels.json`, written by hand and never changed to improve a score. A
+finding counts as correct when its issue type and file match and its line is within
+±3 lines; matching is one-to-one, so duplicates count as false positives. Four
+approaches are compared with the same cases and rules:
 
-The constants live in `project.py`:
+- `static_only`: Bandit and Ruff, no LLM
+- `llm_only`: one LLM call per file, no tools
+- `agentic`: the tool-using agent
+- `agentic_verified`: the same agent findings, after evidence verification
 
-- 10 investigation turns plus at most one finalization request (single-file mode retains 5).
-- 100 eligible files, 2,000 directory entries examined, and 20 directory levels.
-- 100,000 bytes per source file; oversized files are excluded or refused if they grow.
-- 10 distinct files explicitly inspected or analyzed; repeat visits count once.
-- 100 lines per inspection, 20 matches per search, 60 matches across a review.
-- Search scans the bounded eligible-file list, separately from the explicit inspection budget.
-- 8,000 serialized characters per observation and 40,000 per request conversation,
-  including tool definitions, instructions, tool calls, and observations. This is
-  a character limit, not exact token accounting. The existing model output cap also applies.
-- Tool-request payloads are capped at 1,500 serialized characters in project mode.
+**Results** (run of 2026-10-20: 12 cases × 2 repeats; `gpt-6-luna` and Groq's free
+`openai/gpt-oss-120b`; prices from `evaluation/pricing.json`):
 
-Whole output entries are removed when necessary, before JSON serialization, with
-`truncated: true`. Long search lines return at most 300 characters around the match.
-Counters conservatively include matches found even if context trimming omits them.
-The loop reserves context space for finalization and disables tools when it is nearly
-full. Coverage metadata records observed files, inspected files, search counts, and
-limits reached. A valid final report can still have partial coverage; the terminal
-makes that visible. Incomplete reports retain their trace.
+| Approach | Model | Precision | Recall | F1 (range over repeats) | Completed |
+| --- | --- | --- | --- | --- | --- |
+| static_only | Bandit + Ruff | 56% | 100% | 71% (71-71%) | 22/22 |
+| llm_only | gpt-6-luna | 29% | 100% | 45% (43-47%) | 18/20 |
+| llm_only | gpt-oss-120b | 20% | 100% | 33% (32-33%) | 20/20 |
+| agentic | gpt-6-luna | 48% | 91% | 62% (59-67%) | 23/24 |
+| agentic | gpt-oss-120b | 33% | 100% | 50% (40-60%) | 13/24 |
+| agentic_verified | gpt-6-luna | 44% | 73% | 55% (50-62%) | 23/24 |
+| agentic_verified | gpt-oss-120b | 42% | 100% | 59% (50-67%) | 13/24 |
 
-### Access boundaries
+Measured cost: the 24 `agentic` reviews with `gpt-6-luna` used 57,789 input and 9,700
+output tokens, about **$0.01 in total** ($0.0005 per review). Some totals are unknown
+because failed calls report no token counts. Average review time: 0.2 s for Bandit and
+Ruff, about 9 s for the `gpt-6-luna` agent, and about 12 s with verification.
 
-Only eligible project-relative regular `.py` files can be read. Absolute paths,
-`..`, symlinks, and special files are rejected, and every read checks that the
-resolved path is still inside the project folder. Hidden paths, Git internals,
-virtual environments (including directories containing `pyvenv.cfg`),
-dependency/build/cache directories, and names containing `secret`, `credential`,
-`password`, or `private_key` are excluded. `config_local.py` and `local_settings.py`
-are also excluded. This conservative policy may omit legitimate code; it is not a
-general secret detector. Credentials embedded in ordinary eligible source can still
-be sent to the provider. `.gitignore` is not interpreted.
+**Second view** (clearly separate from the main score): many false positives were
+security or bug comments outside the six benchmark types, such as "missing TLS on the
+database connection". Leaving those out, precision becomes 83% for the `gpt-6-luna`
+agent (F1 87%), 78% for `gpt-6-luna` one-shot (F1 88%), and 62% for Bandit and Ruff
+(F1 77%). The main table keeps counting them, because the rules were fixed before the run.
 
-These are simple, explainable checks, not an operating-system sandbox. CodeGuardian is
-meant for reviewing your own local projects; review a stable checkout.
+**What the results show (and do not show):**
 
-Project analyzer calls first check that the requested file is eligible, then run
-Bandit or Ruff on it and map findings back to the relative path. Ruff never applies fixes.
+- The agent clearly beat a single LLM call with both models (F1 45% → 62% and 33% → 50%):
+  reading the code with tools roughly halved the false alarms.
+- Verification helped Groq (3 false alarms removed, no correct finding lost) but hurt
+  `gpt-6-luna` (1 false alarm removed, 2 correct findings rejected). It is a safety
+  filter with a cost, not a free improvement.
+- On these simple, textbook cases, Bandit and Ruff had the best main F1 at zero cost.
+- Groq's free tier was unreliable for the agent (11 of 24 reviews failed): the model
+  sometimes tried to call a non-existent tool named "JSON", and three runs hit the free
+  limit of 8,000 tokens per minute.
+- 12 small cases are enough to show the method, not to prove one approach is better.
 
-separate manual check.
-
-## v0.6: Git-aware review
+Reproduce or rescore it:
 
 ```bash
-# Existing full-project review (full is the default)
-python3 src/codeguardian/reviewer.py . --agent --mode full
-
-# Review the last commit (plus any uncommitted edits); diff mode implies --agent
-python3 src/codeguardian/reviewer.py . --mode diff
-
-# Review only uncommitted changes
-python3 src/codeguardian/reviewer.py . --mode diff --base HEAD
-
-# Optional trace: choose a new filename; existing files are not overwritten
-python3 src/codeguardian/reviewer.py . --mode diff --trace-file diff-review.json
+python evaluation/evaluate.py --smoke                     # 2 cases, all modes, about 1 cent
+python evaluation/evaluate.py --modes all --models openai:gpt-6-luna,groq:openai/gpt-oss-120b \
+    --repeats 2 --budget 0.50 --pause 20                  # the full run (results vary between runs)
+python evaluation/evaluate.py --score-only                # rebuild the latest report, no API calls
 ```
 
-Existing single-file commands, provider selection, and full-project investigation
-remain available. Diff review uses the existing OpenAI/Groq agent and model settings.
-It requires Git and the repository root directory. Repositories with unresolved merge
-conflicts, or without a valid base commit, receive an error.
-No additional Python dependency is required.
+## Security and limitations
 
-### What is compared
+- **No code execution:** reviewed code is only read, scanned by Bandit and Ruff (which
+  do not run it), and sent to the LLM as untrusted data. Git runs with
+  `--no-ext-diff --no-textconv`, so a repository cannot make Git run external programs.
+- **File access:** only project-relative `.py` files can be read; symlinks, paths
+  outside the project, hidden folders, virtual environments, and names containing
+  `secret`, `credential`, `password`, or `private_key` are refused. This is a filename
+  rule, not a secret detector: a key written inside ordinary code would still be sent.
+- **Secrets:** API keys come from `.env` locally or GitHub secrets in CI. They are never
+  printed, and provider error messages have the key replaced by `[REDACTED]`.
+- **GitHub Actions:** the workflow uses `pull_request` (never `pull_request_target`),
+  read-only permissions, `persist-credentials: false`, a 15-minute timeout, and cancels
+  older runs of the same PR. Fork PRs never receive secrets (GitHub's rule) and the
+  script also skips paid review for them.
+- **Known limitation:** with `pull_request`, the workflow file and CodeGuardian's own
+  code come from the PR branch, so someone who can push branches to this repository could
+  change them to misuse the API key. Fork PRs cannot. Protect the key with repository
+  settings: give write access only to trusted people and require review before merging.
+  Repository content is sent to the LLM even though prompts treat it as data; a prompt
+  injection could still change what the model reports.
+- **AI limits:** findings can be wrong or missing; verification reduces but does not
+  remove false alarms, and it can reject correct findings. Line numbers and evidence are
+  checked against what the agent saw, but the meaning of a finding is not proven.
+- **Scope:** Python only; small projects (limits on files, lines, and conversation size);
+  Git diff mode needs the repository root and a base commit.
 
-The base defaults to `HEAD~1`, so a normal run reviews **the last commit**. The
-comparison is against the current files on disk, so any staged or unstaged edits made
-since then are included too. Use `--base HEAD` to review only uncommitted work, or any
-other commit (for example `--base main`).
-
-CodeGuardian runs `git diff <base> -- '*.py'` to list changed Python files and then
-asks Git for each file's patch. New files must be added with `git add` before they
-appear. The same filename exclusions as project mode apply (for example, a changed
-`secrets.py` is counted as excluded and never sent). Files that are now symlinks or
-too large are reported as skipped. Git commands use fixed argument lists (no shell),
-a 30-second timeout, and `--no-ext-diff --no-textconv` so the repository cannot make
-Git run external diff programs. Nothing is staged, committed, or modified.
-Only review repositories you trust: Git still applies a repository's own configured
-content filters when it reads files.
-
-### Agent context and evidence
-
-The existing agent receives changed-file statuses, old/new paths, patches, added/removed
-line numbers, and coverage limitations in its initial user message. There is no new
-agent or unrestricted Git/shell tool. It may use `list_files`, `inspect_file`, `search_code`,
-Bandit, and Ruff to investigate changed files and related unchanged Python files.
-
-Diff hunk headers initialize separate old/current line counters. A `+` line advances
-the current counter; a `-` line advances the old counter; context advances both.
-Only locations in delivered hunks or successful tool observations may be cited.
-Deleted files may be discussed using baseline patches even when no current Python files
-remain. Their finding uses the old path and `line: null`, with old line numbers explicitly
-identified in evidence. Current files use current line numbers.
-
-Diff findings retain `category`, `severity`, `title`, `file`, `line`, `description`,
-`recommendation`, and `source`, and require a nonempty `evidence` string. Evidence should
-cite observed code or tool output and explain its connection to a change. It is printed
-in the terminal and retained in the trace. The agent is instructed to omit unrelated
-pre-existing findings, including those found by Bandit/Ruff. Relevance and evidence
-correctness are still model judgments: v0.6 adds neither semantic verification nor
-deduplication. Patches, filenames, and tool outputs are untrusted data, not instructions.
-
-### Bounds and coverage
-
-Initial change context is limited to 20 changed files and 12,000 serialized
-characters, inside the existing 40,000-character conversation budget. Whole
-hunks/records are omitted when necessary; counts and limitations are shown. All agent
-step, tool-observation, and search limits remain active.
-
-An empty eligible diff finishes without loading API settings or calling the LLM. If
-collection failed or skipped files, the program reports incomplete coverage instead
-of claiming a clean review. Optional traces include exactly the initial bounded change
-context supplied to the model, tool calls/observations, and final findings, without
-chain-of-thought. Traces may contain source code.
-
-Tests use temporary Git repositories for staged/unstaged changes, renames,
-deletions, bases, merge conflicts, unusual filenames, path restrictions,
-line parsing, context caps, and mocked agent/CLI integration. Run them with the existing
-`python -m unittest discover -s tests -v` command inside the virtual environment.
-
-OpenAI agent requests use Chat Completions tool calling, preserving the existing
-message loop. Groq-only request options are omitted for OpenAI. See the
-[official OpenAI documentation](https://developers.openai.com/api/docs/guides/function-calling).
-
-## v0.7: Evidence verification
+## Demo
 
 ```bash
-# Opt-in: one extra API call per finding (at most 10), so it is off by default
-python3 src/codeguardian/reviewer.py . --mode diff --verify
-python3 src/codeguardian/reviewer.py . --agent --verify
-```
+# 1. Free: unit tests (no API calls)
+python -m unittest discover -s tests
 
-After the agent finishes, `--verify` checks each finding separately. The original
-findings are not changed; results are added to the report under `verification` and
-printed in an "Evidence Verification" section (`F001` is finding 1, and so on). This
-is a fixed pipeline in `verifier.py`, not a second agent: the verifier has no tools.
-
-For each finding:
-
-1. **Check the location (code).** The file must be an eligible project file (the same
-   rules as `inspect_file`) and the line must exist. Otherwise the result is
-   `unsupported` and no API call is made.
-2. **Collect evidence (code).** The cited line ±10 lines (at most 40 lines and
-   4,000 characters), plus the diff patch for that file in diff mode. Deleted files
-   are checked against their patch only.
-3. **Correlate tools (code).** Bandit (for `security` findings) and Ruff (for
-   `quality`/`bug` findings) are run locally on the file; results within 3 lines count
-   as corroboration.
-4. **Ask the model (one call).** It receives only the evidence above and returns
-   `{"status", "reason", "evidence_lines"}`. Source and tool output are untrusted data.
-5. **Apply fixed rules (code).** The model's answer is not trusted on its own:
-
-| Situation | Final status |
-| --- | --- |
-| Bad file/line location | `unsupported` |
-| Malformed finding, project-wide finding, API error, timeout, or invalid JSON | `uncertain` |
-| Model says `supported` but cites no line from the supplied source | `uncertain` |
-| Model says `supported` for a finding with no line, and no tool agrees | `uncertain` |
-| Model says `unsupported` but Bandit/Ruff flags the same area | `uncertain` (conflict) |
-| Otherwise | the model's status |
-
-Only lines that were actually supplied to the model can appear as `evidence`, so
-locations are never invented. `independent_corroboration` is true only when Bandit or
-Ruff agrees: a second LLM call agreeing with the first is not independent proof.
-Each result records token usage and latency when the provider reports them, and the
-terminal prints the totals. Findings beyond the first 10 are marked `uncertain`
-("not verified: limit reached"). Findings already removed by the agent's location
-check are not verified. Verification supports OpenAI and Groq, like the agent.
-
-## Demo: v0.6 and v0.7 end to end
-
-```bash
-# One real review of a tiny two-commit repository (about a cent of API credit)
+# 2. About one cent: build a two-commit repository, review only the last commit, verify findings
 python examples/demo_diff_review.py
 
-# The same check as an optional live test (skipped unless enabled)
-CODEGUARDIAN_LIVE_TEST=1 python -m unittest tests.test_live_demo -v
+# 3. Pull request demo: on a new branch, add a SQL injection to a Python file, push, and
+#    open a pull request. The "CodeGuardian review" check shows the report in its Summary.
 ```
 
-The demo builds a temporary repository: the first commit has a safe `app.py` and a
-`helper.py` with an old `eval` bug; the second commit adds an SQL injection to `app.py`.
-It runs `--mode diff --verify` and checks the trace: the base is `HEAD~1`, only `app.py`
-is reviewed, the SQL injection is found, the old `helper.py` bug is not reported, and
-verification marks the finding `supported` with Bandit agreeing. LLM output varies, so
-a single run can occasionally differ. A real run is saved in
-[examples/sample-output.txt](examples/sample-output.txt) and
-[examples/sample-trace.json](examples/sample-trace.json).
+A saved real run of step 2 is in [examples/sample-output.txt](examples/sample-output.txt)
+and [examples/sample-trace.json](examples/sample-trace.json).
 
-## v0.8: Evaluation
+## Project layout
 
-```bash
-python evaluation/evaluate.py --cases sql_vulnerable,sql_safe   # small trial
-python evaluation/evaluate.py                                   # all 12 cases (about 10-30 cents)
-python evaluation/evaluate.py --score-only                      # rescore saved results, no API calls
+Every file has one job and is at most about 240 lines.
+
 ```
-
-**Benchmark.** `evaluation/cases/` has 12 small hand-written cases: one vulnerable and
-one safe example for SQL injection, command injection, hard-coded credentials, unsafe
-deserialization (`pickle`), path traversal, and weak password hashing (MD5). The
-deserialization case spans two files. The path traversal case is a Git-diff case: its
-unchanged file has an old MD5 checksum that a diff review should not report. Each safe
-file explains in a comment why it is safe (for example, a parameterized query or a
-`resolve()` check). Ground truth is in `evaluation/labels.json`, written by hand; no LLM
-decides it. The case code is never executed. Because the samples are intentionally
-vulnerable, exclude `evaluation/cases/` when you run Bandit or Ruff on this repository.
-
-**How it runs.** Each case is reviewed once by the normal `reviewer.py` CLI with
-`--verify`. Raw traces and printed output are saved in `evaluation/results/raw/`.
-**Before** scores all candidate findings; **after** keeps only findings verification
-marked `supported`. Both come from the same agent run, so differences are caused by
-verification alone.
-
-**Matching rules.**
-- Only `security` and `bug` findings are scored (the benchmark does not label quality or testing issues).
-- A keyword list maps each finding's title and description to an issue type (`TYPE_KEYWORDS` in `evaluation/scoring.py`).
-- A finding matches a label when the type and file are the same and the line is within **±3 lines**.
-- Matching is one-to-one: each label is matched by its closest finding, so duplicates count as false positives.
-- Unmatched findings are false positives (FP); unmatched labels are false negatives (FN).
-
-**Metrics.** Precision = TP / (TP + FP), recall = TP / (TP + FN), and F1. When a
-denominator is zero the value is shown as "n/a" (for example, precision when there are
-no findings); F1 is 0 when both precision and recall are 0. The report also counts
-supported/uncertain/unsupported results, correct findings rejected by verification, and
-verification tokens (agent tokens are not tracked). A failed or incomplete review is
-listed as failed and left out of the metrics; it is never counted as a clean result.
-`results.json` holds every number; `summary.md` is a readable table with the false
-positives and missed issues to investigate.
-
-Limitations: 12 cases are enough to show the method, not to make strong claims, and
-LLM results vary between runs.
-
-## v0.9: Quality, speed, and cost benchmark
-
-```bash
-python evaluation/evaluate.py --modes static_only            # free: Bandit + Ruff only
-python evaluation/evaluate.py --smoke                        # 2 cases, all modes: run this first
-python evaluation/evaluate.py --modes all \
-    --models openai:gpt-6-luna,groq:openai/gpt-oss-120b --repeats 2 --budget 1.00 --pause 20
-python evaluation/evaluate.py --score-only                   # rebuild the latest report, no API calls
+src/codeguardian/
+  reviewer.py         command line: reads options and prints results
+  agent.py            the agent loop: ask the model, run the tool it chose, repeat
+  agent_tools.py      the tools the model may ask for, and the checks on each request
+  prompts.py          the instructions the agent receives
+  tools.py            Bandit, Ruff, reading files, and searching code
+  project.py          which project files may be read, and the size limits
+  git_changes.py      collects Git changes (last commit, any base, or a merge base)
+  changed_lines.py    marks findings on changed lines; free Bandit/Ruff fallback
+  verifier.py         evidence verification
+  findings.py         checks and prints findings
+  markdown_report.py  the Markdown review report
+  providers/          everything that talks to an LLM
+    settings.py         provider, model, and API key from .env
+    review.py           the one-shot review (one request, no tools)
+    agent_calls.py      one agent turn (OpenAI or Groq) and one verification request
+    usage.py            token counts and short error messages
+evaluation/           benchmark: evaluate.py, modes.py, scoring.py, report.py, cases, labels
+.github/              the pull request workflow and its helper script
+examples/             end-to-end demo script and a saved sample run
+tests/                unit tests; no paid API calls
+docs/                 version history (v0.1-v0.9 design notes)
 ```
-
-The v0.8 benchmark now compares four review approaches, all built from existing code.
-The evaluation code is split into four short files:
-
-- `evaluate.py`: the command line, running the cases, and the budget
-- `modes.py`: runs one review mode on one case, using only existing CodeGuardian code
-- `scoring.py`: matches findings to labels and calculates metrics and cost
-- `report.py`: writes `summary.md`
-
-The four modes:
-
-| Mode | What it does | What it can see |
-| --- | --- | --- |
-| `static_only` | Bandit + Ruff, no LLM | fixed rules only |
-| `llm_only` | one `review_code()` call per case | one whole file, no tools |
-| `agentic` | the normal tool-using agent | can read, search, and run tools within a step limit |
-| `agentic_verified` | the same agent findings, then `--verify` | as above, plus evidence verification |
-
-`agentic` and `agentic_verified` share **one** agent run, so their difference comes from
-verification alone and the agent is paid for once. Every mode is scored with the same
-v0.8 matching rules and labels. Cases a mode cannot handle fairly are reported as
-**unsupported**, not as clean: `llm_only` skips the multi-file and Git-diff cases, and
-`static_only` skips the Git-diff case. Without `--modes`, the command runs `agentic` and
-`agentic_verified`, which is the v0.8 before/after comparison.
-
-**Measured per review:** time, LLM calls, tool calls, input/cached/output tokens (from
-OpenAI-compatible providers; Claude and Gemini usage is reported as unavailable),
-status, errors, and timeouts. CodeGuardian makes no automatic retries, so retries are 0.
-A missing value is shown as `n/a` or `unavailable`, never as 0.
-
-**Cost** uses `evaluation/pricing.json` (USD per 1,000,000 tokens, with a pricing date):
-(input - cached) x input price + cached x cached price + output x output price.
-A missing price makes the cost **unknown**. If cached tokens are not reported, all input
-is charged at the full price and the cost is marked **upper bound**. Agent and
-verification tokens are added once each. Costs are estimates, not bills; Groq's free
-tier is not billed at all.
-
-**Budget.** `--budget` is approximate: before each case it stops the LLM modes if
-"spent so far + average cost per case" would exceed the limit (5 cents is assumed before
-the first case). A single case can still go over, because its cost is only known after it
-runs. `static_only` keeps running because it is free. `--budget` needs prices for every model.
-
-**Reproducibility.** Each run is saved in `evaluation/results/<date-time>/` with
-`run_info.json` (git commit, dataset hash, models, modes, repeats, limits), one raw JSON
-file per review, `results.json`, and `summary.md`. The report compares modes and models
-side by side (quality, speed and cost, reliability, false positives by category, the
-effect of verification), lists missing or incomparable data, and ends with limitations
-and an empty Discussion section to write by hand. It does not pick a winner.
-
-**OpenAI API style.** The OpenAI agent uses the Responses API, because newer reasoning
-models such as `gpt-6-luna` only allow tools there. Groq still uses Chat Completions.
-The agent's own message format is unchanged; `providers` converts it for OpenAI. The
-optional `.env` setting `OPENAI_REASONING_EFFORT` (for example `none`) applies to every
-OpenAI call, so the modes stay comparable, and it is recorded in each benchmark run.
-API errors now include the provider's short message, with the API key removed.
-
-**Free-tier note.** Groq's free tier has request and token rate limits. Agent requests
-can be large, so some reviews may fail with an API error; they are reported as failed.
-`--pause` adds a wait between cases to reduce this.
